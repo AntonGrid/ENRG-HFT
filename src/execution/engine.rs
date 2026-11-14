@@ -12,10 +12,11 @@
 //! ```
 //!
 //! The executor never blocks the market-data path: it reads the freshest
-//! [`MarketSnapshot`] from a `watch` channel and only speaks to the exchange
-//! from its own task.
+//! [`MarketSnapshot`] for the symbol it is about to trade (or is holding) from
+//! the shared [`MarketBoard`] and only speaks to the exchange from its own task.
 
 use std::str::FromStr;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -24,13 +25,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::ai_brain::AiAction;
-use crate::exchange::htx;
 use crate::execution::broker::Broker;
 use crate::execution::htx_rest::HtxRest;
 use crate::execution::portfolio::Portfolio;
 use crate::execution::risk::{Intent, RiskGuard, RiskLimits};
 use crate::execution::{ExecutionError, OrderReport, OrderRequest, OrderStatus, Side};
-use crate::strategy::{MarketSnapshot, Signal};
+use crate::strategy::{MarketBoard, MarketSnapshot, Signal};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// How often a live order is re-queried (HTX rate limits are per second).
@@ -74,7 +74,6 @@ impl ExecutionMode {
 /// Every knob the executor needs, read once at boot.
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-    pub symbol: String,
     /// Target notional per entry, in quote currency (USDT).
     pub order_notional: Decimal,
     pub min_order_notional: Decimal,
@@ -92,6 +91,7 @@ pub struct ExecutorConfig {
     pub order_ttl: Duration,
     pub slippage_bps: Decimal,
     pub fee_bps: Decimal,
+    /// Fallback venue steps for symbols the scanner has no metadata for.
     pub base_step: Decimal,
     pub price_step: Decimal,
     pub paper_start_cash: Decimal,
@@ -100,7 +100,6 @@ pub struct ExecutorConfig {
 impl ExecutorConfig {
     pub fn from_env() -> Result<Self, ExecutionError> {
         let config = Self {
-            symbol: htx::trading_symbol(),
             order_notional: env_decimal("EXEC_ORDER_NOTIONAL_USDT", "25")?,
             min_order_notional: env_decimal("EXEC_MIN_NOTIONAL_USDT", "5")?,
             max_order_notional: env_decimal("EXEC_MAX_ORDER_NOTIONAL_USDT", "50")?,
@@ -208,6 +207,7 @@ fn env_duration(name: &str, default_secs: u64) -> Result<Duration, ExecutionErro
 pub struct AccountView {
     pub equity: Option<Decimal>,
     pub cash: Option<Decimal>,
+    pub position_symbol: Option<String>,
     pub position_qty: Decimal,
     pub avg_entry: Decimal,
     pub unrealized: Option<Decimal>,
@@ -219,9 +219,13 @@ pub struct AccountView {
 impl AccountView {
     pub fn describe(&self) -> String {
         format!(
-            "equity={} cash={} position_qty={} avg_entry={} unrealized={} realized_today={} trades={} halted={}",
+            "equity={} cash={} position_symbol={} position_qty={} avg_entry={} unrealized={} realized_today={} trades={} halted={}",
             option_text(self.equity),
             option_text(self.cash),
+            self.position_symbol
+                .as_deref()
+                .map(|symbol| symbol.to_uppercase())
+                .unwrap_or_else(|| "-".to_string()),
             self.position_qty,
             self.avg_entry,
             option_text(self.unrealized),
@@ -241,18 +245,23 @@ fn option_text(value: Option<Decimal>) -> String {
 /// Everything the executor can be told.
 #[derive(Debug)]
 pub enum ExecutionCommand {
-    /// A market dislocation from the strategy.
+    /// A market dislocation from the strategy, already tagged with its symbol.
     Signal(Signal),
-    /// A fresh risk verdict from the AI layer.
-    Verdict { action: AiAction, reason: String },
+    /// A fresh risk verdict from the AI layer, naming the pair to trade.
+    Verdict {
+        action: AiAction,
+        symbol: Option<String>,
+        reason: String,
+    },
     /// Operator kill switch (Ctrl-C, fatal error elsewhere).
     Halt(String),
 }
 
-/// The AI gate: entries require a fresh `TRADE` verdict.
+/// The AI gate: entries require a fresh `TRADE` verdict for that exact symbol.
 #[derive(Debug, Clone)]
 struct Gate {
     action: AiAction,
+    symbol: Option<String>,
     reason: String,
     at: Option<Instant>,
 }
@@ -261,13 +270,16 @@ impl Gate {
     fn closed() -> Self {
         Self {
             action: AiAction::Pause,
+            symbol: None,
             reason: "no AI verdict yet".into(),
             at: None,
         }
     }
 
-    fn permits(&self, ttl: Duration, now: Instant) -> bool {
-        self.action == AiAction::Trade && self.at.is_some_and(|at| now.duration_since(at) <= ttl)
+    fn permits(&self, symbol: &str, ttl: Duration, now: Instant) -> bool {
+        self.action == AiAction::Trade
+            && self.symbol.as_deref() == Some(symbol)
+            && self.at.is_some_and(|at| now.duration_since(at) <= ttl)
     }
 }
 
@@ -296,6 +308,10 @@ pub struct Executor {
     risk: RiskGuard,
     gate: Gate,
     working: Option<TrackedOrder>,
+    /// Symbol of the open position (or of the entry order being filled).
+    open_symbol: Option<String>,
+    /// The shared multi-pair board: signals, prices, steps, watchlist.
+    board: Arc<RwLock<MarketBoard>>,
     trades: u32,
     wins: u32,
     open_fees: Decimal,
@@ -313,6 +329,7 @@ impl Executor {
     pub fn new(
         cfg: ExecutorConfig,
         mode: ExecutionMode,
+        board: Arc<RwLock<MarketBoard>>,
         account_tx: watch::Sender<AccountView>,
     ) -> Result<Self, ExecutionError> {
         let broker = match mode {
@@ -346,6 +363,8 @@ impl Executor {
             risk,
             gate: Gate::closed(),
             working: None,
+            open_symbol: None,
+            board,
             trades: 0,
             wins: 0,
             open_fees: Decimal::ZERO,
@@ -358,17 +377,40 @@ impl Executor {
         })
     }
 
+    fn board(&self) -> RwLockReadGuard<'_, MarketBoard> {
+        self.board
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn board_mut(&self) -> RwLockWriteGuard<'_, MarketBoard> {
+        self.board
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn snapshot_for(&self, symbol: &str) -> Option<MarketSnapshot> {
+        self.board().snapshot(symbol)
+    }
+
+    fn steps_for(&self, symbol: &str) -> (Decimal, Decimal) {
+        self.board()
+            .steps(symbol)
+            .unwrap_or((self.cfg.base_step, self.cfg.price_step))
+    }
+
+    /// Keeps the open position's symbol streaming until it is flat.
+    fn pin_board(&self, symbol: Option<String>) {
+        self.board_mut().pin(symbol);
+    }
+
     /// Runs until a [`ExecutionCommand::Halt`] arrives or the command channel
     /// closes.
-    pub async fn run(
-        mut self,
-        mut commands: mpsc::Receiver<ExecutionCommand>,
-        market: watch::Receiver<MarketSnapshot>,
-    ) {
+    pub async fn run(mut self, mut commands: mpsc::Receiver<ExecutionCommand>) {
         println!(
-            "[EXEC] mode={} symbol={} order_notional={}USDT tp={}% sl={}% max_hold={}s gate_ttl={}s",
+            "[EXEC] mode={} pairs={} order_notional={}USDT tp={}% sl={}% max_hold={}s gate_ttl={}s",
             self.broker.name(),
-            self.cfg.symbol,
+            self.board().pairs().len(),
             self.cfg.order_notional,
             self.cfg.take_profit_pct,
             self.cfg.stop_loss_pct,
@@ -388,14 +430,12 @@ impl Executor {
                 biased;
                 command = commands.recv() => {
                     let Some(command) = command else { break };
-                    let snapshot = market.borrow().clone();
-                    if !self.handle_command(command, &snapshot).await {
+                    if !self.handle_command(command).await {
                         break;
                     }
                 }
                 _ = ticker.tick() => {
-                    let snapshot = market.borrow().clone();
-                    self.on_tick(&snapshot).await;
+                    self.on_tick().await;
                 }
             }
         }
@@ -404,88 +444,147 @@ impl Executor {
     }
 
     /// Handles one command. Returns `false` when the executor should stop.
-    async fn handle_command(
-        &mut self,
-        command: ExecutionCommand,
-        snapshot: &MarketSnapshot,
-    ) -> bool {
+    async fn handle_command(&mut self, command: ExecutionCommand) -> bool {
         match command {
             ExecutionCommand::Signal(signal) => {
-                self.try_enter(signal, snapshot).await;
+                self.try_enter(signal).await;
                 true
             }
-            ExecutionCommand::Verdict { action, reason } => {
-                println!("[EXEC] AI gate {} — {}", action.as_str(), reason);
-                self.gate = Gate {
-                    action,
-                    reason,
-                    at: Some(Instant::now()),
+            ExecutionCommand::Verdict {
+                action,
+                symbol,
+                reason,
+            } => {
+                let symbol = symbol.and_then(|symbol| crate::scanner::normalize_symbol(&symbol));
+                let valid_symbol = match action {
+                    AiAction::Trade => match &symbol {
+                        Some(candidate) if self.board().is_active(candidate) => {
+                            Some(candidate.clone())
+                        }
+                        Some(candidate) => {
+                            println!(
+                                "[EXEC] AI picked {}, which is not on the scanner watchlist; gate stays closed",
+                                candidate.to_uppercase()
+                            );
+                            None
+                        }
+                        None => {
+                            println!("[EXEC] AI sent TRADE without a symbol; gate stays closed");
+                            None
+                        }
+                    },
+                    AiAction::Pause => None,
                 };
+
+                println!(
+                    "[EXEC] AI gate {}{} — {}",
+                    action.as_str(),
+                    valid_symbol
+                        .as_deref()
+                        .map(|symbol| format!(" {}", symbol.to_uppercase()))
+                        .unwrap_or_default(),
+                    reason
+                );
                 if action == AiAction::Pause && !self.portfolio.position.is_flat() {
                     println!(
                         "[EXEC] entries disabled by the AI; the open position keeps its TP/SL"
                     );
                 }
+                self.gate = Gate {
+                    action,
+                    symbol: valid_symbol,
+                    reason,
+                    at: Some(Instant::now()),
+                };
                 true
             }
             ExecutionCommand::Halt(reason) => {
-                self.handle_halt(reason, snapshot).await;
+                self.handle_halt(reason).await;
                 false
             }
         }
     }
 
     /// A dislocation arrived: gate, size, risk-check, place.
-    async fn try_enter(&mut self, signal: Signal, snapshot: &MarketSnapshot) {
+    async fn try_enter(&mut self, signal: Signal) {
+        let symbol = signal.symbol.clone();
+        if !self.board().is_active(&symbol) {
+            println!(
+                "[EXEC] skip {} {}: not on the scanner watchlist",
+                symbol.to_uppercase(),
+                signal.side.as_str()
+            );
+            return;
+        }
+        let Some(snapshot) = self.snapshot_for(&symbol) else {
+            println!(
+                "[EXEC] skip {} {}: no market data yet",
+                symbol.to_uppercase(),
+                signal.side.as_str()
+            );
+            return;
+        };
         if !self.portfolio.position.is_flat() {
             println!(
-                "[EXEC] skip {}: position already open ({})",
+                "[EXEC] skip {} {}: position already open ({} {})",
+                symbol.to_uppercase(),
                 signal.side.as_str(),
-                self.portfolio.position.qty()
+                self.portfolio.position.qty(),
+                self.open_symbol.as_deref().unwrap_or("?").to_uppercase()
             );
             return;
         }
         if self.working.is_some() {
             println!(
-                "[EXEC] skip {}: an order is already working",
+                "[EXEC] skip {} {}: an order is already working",
+                symbol.to_uppercase(),
                 signal.side.as_str()
             );
             return;
         }
 
         let now = Instant::now();
-        if !self.gate.permits(self.cfg.gate_ttl, now) {
+        if !self.gate.permits(&symbol, self.cfg.gate_ttl, now) {
             println!(
-                "[EXEC] skip {}: AI gate is {} ({})",
+                "[EXEC] skip {} {}: AI gate is {} for {} ({})",
+                symbol.to_uppercase(),
                 signal.side.as_str(),
                 self.gate.action.as_str(),
+                self.gate
+                    .symbol
+                    .as_deref()
+                    .map(|symbol| symbol.to_uppercase())
+                    .unwrap_or_else(|| "-".to_string()),
                 self.gate.reason
             );
             return;
         }
 
-        let Some(touch) = entry_price(signal.side, snapshot) else {
-            println!("[EXEC] skip {}: no top of book", signal.side.as_str());
+        let Some(touch) = entry_price(signal.side, &snapshot) else {
+            println!(
+                "[EXEC] skip {} {}: no top of book",
+                symbol.to_uppercase(),
+                signal.side.as_str()
+            );
             return;
         };
 
-        let amount = size_order(self.cfg.order_notional, touch, self.cfg.base_step);
+        let (base_step, price_step) = self.steps_for(&symbol);
+        let amount = size_order(self.cfg.order_notional, touch, base_step);
         if amount <= Decimal::ZERO {
             println!(
-                "[EXEC] skip: {} USDT buys less than one {}-step at {}",
-                self.cfg.order_notional, self.cfg.base_step, touch
+                "[EXEC] skip {}: {} USDT buys less than one {}-step at {}",
+                symbol.to_uppercase(),
+                self.cfg.order_notional,
+                base_step,
+                touch
             );
             return;
         }
 
-        let limit = aggressive_limit(
-            self.cfg.slippage_bps,
-            signal.side,
-            touch,
-            self.cfg.price_step,
-        );
+        let limit = aggressive_limit(self.cfg.slippage_bps, signal.side, touch, price_step);
         let request = OrderRequest {
-            symbol: self.cfg.symbol.clone(),
+            symbol: symbol.clone(),
             side: signal.side,
             amount,
             price: limit,
@@ -526,18 +625,20 @@ impl Executor {
             "[EXEC] placing {} {} {} @ {} (signal: {})",
             signal.side.as_str(),
             amount,
-            self.cfg.symbol,
+            symbol.to_uppercase(),
             limit,
             signal.reason
         );
 
-        match self.broker.place(&request, snapshot).await {
+        match self.broker.place(&request, &snapshot).await {
             Ok(report) => {
                 println!(
                     "[EXEC] order {} accepted: {}",
                     report.order_id,
                     report.status.as_str()
                 );
+                self.open_symbol = Some(symbol.clone());
+                self.pin_board(Some(symbol));
                 self.working = Some(TrackedOrder {
                     request,
                     report,
@@ -575,10 +676,14 @@ impl Executor {
                     if self.opened_at.is_none() {
                         self.opened_at = Some(Instant::now());
                     }
+                    if self.open_symbol.as_deref() != Some(working.request.symbol.as_str()) {
+                        self.open_symbol = Some(working.request.symbol.clone());
+                        self.pin_board(self.open_symbol.clone());
+                    }
                     println!(
                         "[EXEC] entry fill {} {} @ {} (fee {})",
                         delta,
-                        working.request.symbol,
+                        working.request.symbol.to_uppercase(),
                         price.round_dp(8),
                         fee.round_dp(8)
                     );
@@ -587,7 +692,7 @@ impl Executor {
                     println!(
                         "[EXEC] exit fill {} {} @ {} (fee {})",
                         delta,
-                        working.request.symbol,
+                        working.request.symbol.to_uppercase(),
                         price.round_dp(8),
                         fee.round_dp(8)
                     );
@@ -640,17 +745,37 @@ impl Executor {
         self.open_fees = Decimal::ZERO;
         self.opened_at = None;
         self.exit_retry_after = None;
+        self.open_symbol = None;
+        self.pin_board(None);
     }
 
     /// Periodic maintenance: fills, live status, order expiry, exits.
-    async fn on_tick(&mut self, snapshot: &MarketSnapshot) {
+    /// Periodic maintenance: fills, live status, order expiry, exits.
+    async fn on_tick(&mut self) {
         self.risk.roll_day(Utc::now().date_naive());
-        if let Some(mark) = snapshot.mark_price() {
-            self.last_mark = Some(mark);
+
+        let tracked_symbol = self
+            .working
+            .as_ref()
+            .map(|working| working.request.symbol.clone())
+            .or_else(|| self.open_symbol.clone());
+        let Some(snapshot) = tracked_symbol
+            .as_deref()
+            .and_then(|symbol| self.snapshot_for(symbol))
+        else {
+            // Nothing is held or resting: no fills or exits to manage yet.
+            self.publish_account();
+            return;
+        };
+
+        if Some(snapshot.symbol.as_str()) == self.open_symbol.as_deref() {
+            if let Some(mark) = snapshot.mark_price() {
+                self.last_mark = Some(mark);
+            }
         }
 
         // Paper fills happen on market moves; live fills arrive via polling.
-        let updates = self.broker.on_market(snapshot);
+        let updates = self.broker.on_market(&snapshot);
         if let Some(working) = self.working.as_mut() {
             if let Some(update) = updates
                 .iter()
@@ -710,7 +835,15 @@ impl Executor {
             }
         }
 
-        self.maybe_exit(snapshot).await;
+        self.maybe_exit().await;
+
+        // An entry that was cancelled or rejected leaves no position and no
+        // working order: release the position pin and its book.
+        if self.portfolio.position.is_flat() && self.working.is_none() && self.open_symbol.is_some()
+        {
+            self.open_symbol = None;
+            self.pin_board(None);
+        }
 
         if self.risk.is_halted() && !self.halt_logged {
             println!(
@@ -723,11 +856,24 @@ impl Executor {
         self.publish_account();
     }
 
-    /// Closes the position on take-profit, stop-loss or timeout.
-    async fn maybe_exit(&mut self, snapshot: &MarketSnapshot) {
+    /// Closes the position on take-profit, stop-loss or timeout, using the book
+    /// of the symbol that is actually held.
+    async fn maybe_exit(&mut self) {
         if self.working.is_some() || self.portfolio.position.is_flat() {
             return;
         }
+
+        let Some(symbol) = self.open_symbol.clone() else {
+            eprintln!("[EXEC] open position has no symbol; cannot choose an exit market");
+            return;
+        };
+        let Some(snapshot) = self.snapshot_for(&symbol) else {
+            eprintln!(
+                "[EXEC] no market data for {}; holding the position and waiting",
+                symbol.to_uppercase()
+            );
+            return;
+        };
 
         let now = Instant::now();
         if self.exit_retry_after.is_some_and(|after| now < after) {
@@ -741,7 +887,7 @@ impl Executor {
             return;
         }
 
-        let Some(mark) = exit_mark(qty, snapshot) else {
+        let Some(mark) = exit_mark(qty, &snapshot) else {
             return;
         };
         let pnl_pct = if qty > Decimal::ZERO {
@@ -770,9 +916,10 @@ impl Executor {
             Side::Buy
         };
         let amount = qty.abs();
-        let limit = aggressive_limit(self.cfg.slippage_bps, side, mark, self.cfg.price_step);
+        let (_, price_step) = self.steps_for(&symbol);
+        let limit = aggressive_limit(self.cfg.slippage_bps, side, mark, price_step);
         let request = OrderRequest {
-            symbol: self.cfg.symbol.clone(),
+            symbol: symbol.clone(),
             side,
             amount,
             price: limit,
@@ -793,15 +940,16 @@ impl Executor {
         }
 
         println!(
-            "[EXEC] closing position: {} {} @ {} — {} (pnl {}%)",
+            "[EXEC] closing position: {} {} {} @ {} — {} (pnl {}%)",
             side.as_str(),
             amount,
+            symbol.to_uppercase(),
             limit,
             reason.as_str(),
             pnl_pct.round_dp(3)
         );
 
-        match self.broker.place(&request, snapshot).await {
+        match self.broker.place(&request, &snapshot).await {
             Ok(report) => {
                 self.working = Some(TrackedOrder {
                     request,
@@ -820,7 +968,7 @@ impl Executor {
     }
 
     /// Operator kill switch: latch the guard, cancel working orders and flatten.
-    async fn handle_halt(&mut self, reason: String, snapshot: &MarketSnapshot) {
+    async fn handle_halt(&mut self, reason: String) {
         println!("[EXEC] HALT: {reason}");
         self.risk.halt(reason);
 
@@ -841,6 +989,12 @@ impl Executor {
         }
 
         if !self.portfolio.position.is_flat() {
+            let Some(symbol) = self.open_symbol.clone() else {
+                eprintln!("[EXEC] kill switch: the position has no symbol; cannot flatten");
+                self.publish_account();
+                return;
+            };
+            let snapshot = self.snapshot_for(&symbol).unwrap_or_default();
             let position = self.portfolio.position.clone();
             let qty = position.qty();
             let side = if qty > Decimal::ZERO {
@@ -848,24 +1002,25 @@ impl Executor {
             } else {
                 Side::Buy
             };
-            let touch = entry_price(side, snapshot).or(self.last_mark);
+            let (_, price_step) = self.steps_for(&symbol);
+            let touch = entry_price(side, &snapshot).or(self.last_mark);
 
             if let Some(touch) = touch {
-                let limit =
-                    aggressive_limit(self.cfg.slippage_bps, side, touch, self.cfg.price_step);
+                let limit = aggressive_limit(self.cfg.slippage_bps, side, touch, price_step);
                 let request = OrderRequest {
-                    symbol: self.cfg.symbol.clone(),
+                    symbol: symbol.clone(),
                     side,
                     amount: qty.abs(),
                     price: limit,
                     client_order_id: self.next_client_id(),
                 };
-                match self.broker.place(&request, snapshot).await {
+                match self.broker.place(&request, &snapshot).await {
                     Ok(report) => {
                         println!(
-                            "[EXEC] kill switch: {} {} @ {} → order {} [{}]",
+                            "[EXEC] kill switch: {} {} {} @ {} → order {} [{}]",
                             side.as_str(),
                             qty.abs(),
+                            symbol.to_uppercase(),
                             limit,
                             report.order_id,
                             report.status.as_str()
@@ -888,6 +1043,8 @@ impl Executor {
             }
         }
 
+        self.open_symbol = None;
+        self.pin_board(None);
         self.publish_account();
     }
 
@@ -901,19 +1058,8 @@ impl Executor {
                     .find(|balance| balance.currency == "USDT")
                     .map(|balance| balance.available)
                     .unwrap_or(Decimal::ZERO);
-                let base_currency = self
-                    .cfg
-                    .symbol
-                    .strip_suffix("usdt")
-                    .unwrap_or(&self.cfg.symbol)
-                    .to_ascii_uppercase();
-                let base = balances
-                    .iter()
-                    .find(|balance| balance.currency == base_currency)
-                    .map(|balance| balance.available)
-                    .unwrap_or(Decimal::ZERO);
 
-                println!("[EXEC] live balances: USDT={quote} {base_currency}={base}");
+                println!("[EXEC] live balances: USDT={quote}");
                 if quote < self.cfg.order_notional {
                     eprintln!(
                         "[EXEC] WARNING: USDT balance {quote} is below the {} order notional",
@@ -942,11 +1088,12 @@ impl Executor {
         let mark = self.last_mark;
         let view = AccountView {
             equity: if self.broker.is_paper() {
-                mark.map(|mark| self.portfolio.equity(mark))
+                Some(self.portfolio.equity(mark.unwrap_or_default()))
             } else {
                 None
             },
             cash: self.available_cash(),
+            position_symbol: self.open_symbol.clone(),
             position_qty: self.portfolio.position.qty(),
             avg_entry: self.portfolio.position.avg_entry(),
             unrealized: mark.map(|mark| self.portfolio.position.unrealized(mark)),
@@ -968,11 +1115,15 @@ impl Executor {
             "-".to_string()
         };
         println!(
-            "[EXEC] {label}: mode={} equity={} cash={} position={} avg_entry={} realized_today={} realized_total={} trades={} wins={} halted={}",
+            "[EXEC] {label}: mode={} equity={} cash={} position={} symbol={} avg_entry={} realized_today={} realized_total={} trades={} wins={} halted={}",
             self.broker.name(),
             equity,
             option_text(self.available_cash()),
             self.portfolio.position.qty(),
+            self.open_symbol
+                .as_deref()
+                .map(|symbol| symbol.to_uppercase())
+                .unwrap_or_else(|| "-".to_string()),
             self.portfolio.position.avg_entry(),
             self.risk.realized_today().round_dp(4),
             self.portfolio.position.realized_pnl().round_dp(4),
@@ -1081,13 +1232,15 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    use crate::exchange::htx::MarketEvent;
+    use crate::scanner::PairInfo;
+
     fn dec(value: &str) -> Decimal {
         Decimal::from_str(value).expect("test value must be a valid decimal")
     }
 
     fn config() -> ExecutorConfig {
         ExecutorConfig {
-            symbol: "btcusdt".into(),
             order_notional: dec("100"),
             min_order_notional: dec("5"),
             max_order_notional: dec("200"),
@@ -1107,25 +1260,67 @@ mod tests {
         }
     }
 
-    fn snapshot(bid: &str, ask: &str, last: &str) -> MarketSnapshot {
-        MarketSnapshot {
-            symbol: "btcusdt".into(),
-            last_price: Some(dec(last)),
-            best_bid: Some(dec(bid)),
-            best_ask: Some(dec(ask)),
-            ..MarketSnapshot::default()
+    fn pair(symbol: &str, base_step: &str, price_step: &str) -> PairInfo {
+        PairInfo {
+            symbol: symbol.into(),
+            last: dec("1"),
+            change_pct: dec("2"),
+            amplitude_pct: dec("5"),
+            quote_volume: dec("10000000"),
+            spread_bps: None,
+            base_step: dec(base_step),
+            price_step: dec(price_step),
         }
     }
 
-    fn executor(cfg: ExecutorConfig) -> Executor {
-        let (tx, _rx) = watch::channel(AccountView::default());
-        Executor::new(cfg, ExecutionMode::Paper, tx).expect("paper executor must build")
+    fn board_with(symbols: &[(&str, &str, &str)]) -> Arc<RwLock<MarketBoard>> {
+        let mut board = MarketBoard::new();
+        board.set_pairs(
+            symbols
+                .iter()
+                .map(|(symbol, base_step, price_step)| pair(symbol, base_step, price_step))
+                .collect(),
+        );
+        Arc::new(RwLock::new(board))
     }
 
-    fn buy_signal() -> Signal {
+    fn publish(board: &Arc<RwLock<MarketBoard>>, symbol: &str, bid: &str, ask: &str, last: &str) {
+        let mut board = board
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        board.apply(&MarketEvent::Depth {
+            symbol: symbol.into(),
+            best_bid: Some(dec(bid)),
+            best_ask: Some(dec(ask)),
+            exchange_ts_ms: 0,
+            received_ns: 1,
+        });
+        board.apply(&MarketEvent::Trade {
+            symbol: symbol.into(),
+            price: dec(last),
+            exchange_ts_ms: 0,
+            received_ns: 2,
+        });
+    }
+
+    fn executor(cfg: ExecutorConfig, board: Arc<RwLock<MarketBoard>>) -> Executor {
+        let (tx, _rx) = watch::channel(AccountView::default());
+        Executor::new(cfg, ExecutionMode::Paper, board, tx).expect("paper executor must build")
+    }
+
+    fn verdict(symbol: &str) -> ExecutionCommand {
+        ExecutionCommand::Verdict {
+            action: AiAction::Trade,
+            symbol: Some(symbol.into()),
+            reason: "test".into(),
+        }
+    }
+
+    fn buy_signal(symbol: &str, price: &str) -> Signal {
         Signal {
+            symbol: symbol.into(),
             side: Side::Buy,
-            price: dec("65001"),
+            price: dec(price),
             move_pct: dec("1.2"),
             reason: "test dislocation".into(),
         }
@@ -1193,57 +1388,56 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_needs_a_fresh_trade_verdict() {
+    fn the_gate_needs_a_fresh_trade_verdict_for_the_same_symbol() {
         let now = Instant::now();
         let ttl = Duration::from_secs(60);
+        let symbol = "btcusdt";
 
         let mut gate = Gate::closed();
-        assert!(!gate.permits(ttl, now));
+        assert!(!gate.permits(symbol, ttl, now));
 
         gate.action = AiAction::Trade;
+        gate.symbol = Some(symbol.into());
         assert!(
-            !gate.permits(ttl, now),
+            !gate.permits(symbol, ttl, now),
             "a verdict without a timestamp is stale"
         );
 
         gate.at = Some(now - Duration::from_secs(61));
-        assert!(!gate.permits(ttl, now));
+        assert!(!gate.permits(symbol, ttl, now));
 
         gate.at = Some(now);
-        assert!(gate.permits(ttl, now));
+        assert!(gate.permits(symbol, ttl, now));
+        assert!(
+            !gate.permits("ethusdt", ttl, now),
+            "a verdict for one pair cannot open another"
+        );
     }
 
     #[tokio::test]
     async fn paper_round_trip_takes_profit() {
-        let mut executor = executor(config());
-        let entry = snapshot("65000", "65001", "65000.5");
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board.clone());
 
-        assert!(
-            executor
-                .handle_command(
-                    ExecutionCommand::Verdict {
-                        action: AiAction::Trade,
-                        reason: "test".into(),
-                    },
-                    &entry,
-                )
-                .await
-        );
+        assert!(executor.handle_command(verdict("btcusdt")).await);
         executor
-            .handle_command(ExecutionCommand::Signal(buy_signal()), &entry)
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
             .await;
 
         assert!(executor.working.is_none(), "marketable order must fill");
         assert_eq!(executor.portfolio.position.qty(), dec("0.001538"));
         assert_eq!(executor.portfolio.position.avg_entry(), dec("65001"));
+        assert_eq!(executor.open_symbol.as_deref(), Some("btcusdt"));
         assert!(executor.portfolio.cash < dec("10000"));
 
         // +0.92% on the bid crosses the 0.5% take-profit.
-        let exit = snapshot("65600", "65601", "65600");
-        executor.on_tick(&exit).await;
+        publish(&board, "btcusdt", "65600", "65601", "65600");
+        executor.on_tick().await;
 
         assert!(executor.portfolio.position.is_flat());
         assert!(executor.working.is_none());
+        assert!(executor.open_symbol.is_none());
         assert_eq!(executor.trades, 1);
         assert_eq!(executor.wins, 1);
         assert!(executor.portfolio.position.realized_pnl() > Decimal::ZERO);
@@ -1252,11 +1446,12 @@ mod tests {
 
     #[tokio::test]
     async fn closed_gate_blocks_entries() {
-        let mut executor = executor(config());
-        let entry = snapshot("65000", "65001", "65000.5");
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board);
 
         executor
-            .handle_command(ExecutionCommand::Signal(buy_signal()), &entry)
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
             .await;
 
         assert!(executor.portfolio.position.is_flat());
@@ -1265,27 +1460,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sell_signal_cannot_open_a_short_on_spot() {
-        let mut executor = executor(config());
-        let entry = snapshot("65000", "65001", "65000.5");
+    async fn a_verdict_for_one_pair_does_not_open_another() {
+        let board = board_with(&[
+            ("btcusdt", "0.000001", "0.01"),
+            ("listausdt", "1", "0.0001"),
+        ]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        publish(&board, "listausdt", "0.13", "0.1301", "0.13");
+        let mut executor = executor(config(), board.clone());
+
+        // The AI chose LISTA; a BTC dislocation must not be traded.
+        executor.handle_command(verdict("listausdt")).await;
         executor
-            .handle_command(
-                ExecutionCommand::Verdict {
-                    action: AiAction::Trade,
-                    reason: "test".into(),
-                },
-                &entry,
-            )
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
             .await;
+        assert!(executor.portfolio.position.is_flat());
+
+        // The same AI verdict does allow the LISTA signal, on LISTA's steps.
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("listausdt", "0.1301")))
+            .await;
+        assert_eq!(executor.portfolio.position.qty(), dec("768"));
+        assert_eq!(executor.open_symbol.as_deref(), Some("listausdt"));
+    }
+
+    #[tokio::test]
+    async fn a_sell_signal_cannot_open_a_short_on_spot() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board);
+
+        executor.handle_command(verdict("btcusdt")).await;
 
         let signal = Signal {
+            symbol: "btcusdt".into(),
             side: Side::Sell,
             price: dec("65000"),
             move_pct: dec("1.4"),
             reason: "test dislocation".into(),
         };
         executor
-            .handle_command(ExecutionCommand::Signal(signal), &entry)
+            .handle_command(ExecutionCommand::Signal(signal))
+            .await;
+
+        assert!(executor.portfolio.position.is_flat());
+        assert!(executor.working.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_an_unscanned_pair_is_ignored() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board);
+
+        executor.handle_command(verdict("btcusdt")).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("ethusdt", "3000")))
             .await;
 
         assert!(executor.portfolio.position.is_flat());
@@ -1294,28 +1524,23 @@ mod tests {
 
     #[tokio::test]
     async fn halt_flattens_the_position_and_latches_the_guard() {
-        let mut executor = executor(config());
-        let entry = snapshot("65000", "65001", "65000.5");
+        let board = board_with(&[("listausdt", "1", "0.0001")]);
+        publish(&board, "listausdt", "0.13", "0.1301", "0.13");
+        let mut executor = executor(config(), board.clone());
+
+        executor.handle_command(verdict("listausdt")).await;
         executor
-            .handle_command(
-                ExecutionCommand::Verdict {
-                    action: AiAction::Trade,
-                    reason: "test".into(),
-                },
-                &entry,
-            )
-            .await;
-        executor
-            .handle_command(ExecutionCommand::Signal(buy_signal()), &entry)
+            .handle_command(ExecutionCommand::Signal(buy_signal("listausdt", "0.1301")))
             .await;
         assert!(executor.portfolio.position.qty() > Decimal::ZERO);
 
         let stopped = executor
-            .handle_command(ExecutionCommand::Halt("test".into()), &entry)
+            .handle_command(ExecutionCommand::Halt("test".into()))
             .await;
 
         assert!(!stopped, "halt must stop the executor loop");
         assert!(executor.portfolio.position.is_flat());
         assert!(executor.risk.is_halted());
+        assert!(executor.open_symbol.is_none());
     }
 }

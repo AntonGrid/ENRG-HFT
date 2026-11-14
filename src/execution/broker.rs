@@ -51,6 +51,15 @@ impl PaperBroker {
                 "paper broker: no top of book, cannot price an order".into(),
             ));
         }
+        if !request.symbol.is_empty()
+            && !market.symbol.is_empty()
+            && request.symbol != market.symbol
+        {
+            return Err(ExecutionError::Protocol(format!(
+                "paper broker: order for {} cannot be priced against the {} book",
+                request.symbol, market.symbol
+            )));
+        }
 
         self.seq += 1;
         let mut report = OrderReport {
@@ -82,6 +91,11 @@ impl PaperBroker {
         let mut still_resting = Vec::with_capacity(self.resting.len());
 
         for mut resting in self.resting.drain(..) {
+            // A resting order only reacts to the book of its own symbol.
+            if !market.symbol.is_empty() && resting.request.symbol != market.symbol {
+                still_resting.push(resting);
+                continue;
+            }
             if let Some(price) = crossing_price(&resting.request, market) {
                 resting.report.status = OrderStatus::Filled;
                 resting.report.filled_amount = resting.request.amount;
@@ -319,6 +333,46 @@ mod tests {
         let empty = MarketSnapshot::default();
         assert!(paper
             .place(&request(Side::Buy, "0.001", "65000"), &empty)
+            .is_err());
+    }
+
+    #[test]
+    fn resting_orders_only_react_to_their_own_symbol() {
+        let mut paper = PaperBroker::new();
+        let report = paper
+            .place(
+                &request(Side::Buy, "0.001", "64000"),
+                &market("65000", "65001"),
+            )
+            .expect("order must be accepted");
+        assert_eq!(report.status, OrderStatus::Submitted);
+
+        let eth = MarketSnapshot {
+            symbol: "ethusdt".into(),
+            last_price: Some(dec("3000")),
+            best_bid: Some(dec("2999")),
+            best_ask: Some(dec("3000")),
+            ..MarketSnapshot::default()
+        };
+        assert!(paper.on_market(&eth).is_empty());
+        assert_eq!(paper.open_orders(), 1);
+
+        let filled = paper.on_market(&market("63900", "63950"));
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].order_id, report.order_id);
+    }
+
+    #[test]
+    fn refuses_to_price_an_order_against_another_symbol() {
+        let mut paper = PaperBroker::new();
+        let eth_market = MarketSnapshot {
+            symbol: "ethusdt".into(),
+            best_bid: Some(dec("2999")),
+            best_ask: Some(dec("3000")),
+            ..MarketSnapshot::default()
+        };
+        assert!(paper
+            .place(&request(Side::Buy, "0.001", "3001"), &eth_market)
             .is_err());
     }
 

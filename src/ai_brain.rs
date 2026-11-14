@@ -9,12 +9,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::scanner::normalize_symbol;
+
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
 const MODEL: &str = "deepseek-chat";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The exact contract sent to the model.
-pub const SYSTEM_PROMPT: &str = "Ты — риск-менеджер скальпинг-бота. Оцени контекст рынка и верни ТОЛЬКО валидный JSON без markdown-разметки: {\"action\": \"TRADE\" | \"PAUSE\", \"reason\": \"краткая причина\"}";
+pub const SYSTEM_PROMPT: &str = "Ты — риск-менеджер мульти-парного скальпинг-бота на HTX. Тебе дают список USDT-пар с 24ч волатильностью, изменением цены, объёмом и текущим спредом. Выбери ОДНУ пару, где движение сильнее всего и спред приемлем, либо PAUSE. Верни ТОЛЬКО валидный JSON без markdown-разметки: {\"action\": \"TRADE\" | \"PAUSE\", \"symbol\": \"<пара в нижнем регистре или пустая строка>\", \"reason\": \"краткая причина\"}";
 
 /// What the bot is allowed to do after the model has spoken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +36,13 @@ impl AiAction {
 }
 
 /// The model's answer. `reason` is intentionally free-form: it is logged, not
-/// parsed.
+/// parsed. `symbol` names the pair the model wants to trade; the executor
+/// re-validates it against the live scanner watchlist before acting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiDecision {
     pub action: AiAction,
+    #[serde(default)]
+    pub symbol: Option<String>,
     pub reason: String,
 }
 
@@ -130,9 +135,12 @@ pub async fn ask_deepseek(
 }
 
 /// Parses the model's text into a decision, tolerating markdown fences and
-/// chatter around the JSON object.
+/// chatter around the JSON object. The symbol is normalised to HTX's lower-case
+/// form, so `"LISTA-USDT"` and `"listausdt"` are the same market.
 pub fn parse_decision(content: &str) -> Result<AiDecision, serde_json::Error> {
-    serde_json::from_str(sanitize_json(content))
+    let mut decision: AiDecision = serde_json::from_str(sanitize_json(content))?;
+    decision.symbol = decision.symbol.and_then(|symbol| normalize_symbol(&symbol));
+    Ok(decision)
 }
 
 /// Strips ```json fences and everything before the first `{` / after the last
@@ -169,39 +177,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_plain_decision() {
-        let decision = parse_decision(r#"{"action":"TRADE","reason":"volatility spike"}"#)
-            .expect("plain JSON must parse");
+    fn parses_plain_decision_with_a_symbol() {
+        let decision =
+            parse_decision(r#"{"action":"TRADE","symbol":"LISTA-USDT","reason":"pump"}"#)
+                .expect("plain JSON must parse");
         assert_eq!(decision.action, AiAction::Trade);
-        assert_eq!(decision.reason, "volatility spike");
+        assert_eq!(decision.symbol.as_deref(), Some("listausdt"));
+        assert_eq!(decision.reason, "pump");
     }
 
     #[test]
     fn parses_fenced_decision() {
-        let content = "```json\n{\"action\":\"PAUSE\",\"reason\":\"spread too wide\"}\n```";
+        let content =
+            "```json\n{\"action\":\"PAUSE\",\"symbol\":\"\",\"reason\":\"spread too wide\"}\n```";
         let decision = parse_decision(content).expect("fenced JSON must parse");
         assert_eq!(decision.action, AiAction::Pause);
+        assert_eq!(decision.symbol, None);
     }
 
     #[test]
     fn parses_decision_with_surrounding_text() {
-        let content = "Sure, here it is: {\"action\": \"PAUSE\", \"reason\": \"calm\"} — done.";
+        let content =
+            "Sure: {\"action\": \"PAUSE\", \"reason\": \"calm\"} — no pair worth trading.";
         let decision = parse_decision(content).expect("embedded JSON must parse");
         assert_eq!(decision.action, AiAction::Pause);
+        assert_eq!(
+            decision.symbol, None,
+            "a missing symbol defaults to no pair"
+        );
     }
 
     #[test]
     fn rejects_unknown_action() {
-        assert!(parse_decision(r#"{"action":"BUY","reason":"oops"}"#).is_err());
+        assert!(parse_decision(r#"{"action":"BUY","symbol":"btcusdt","reason":"oops"}"#).is_err());
     }
 
     #[test]
     fn serialises_action_in_uppercase() {
         let decision = AiDecision {
             action: AiAction::Trade,
+            symbol: Some("listausdt".into()),
             reason: "test".to_string(),
         };
         let json = serde_json::to_string(&decision).expect("decision must serialise");
         assert!(json.contains("\"action\":\"TRADE\""));
+        assert!(json.contains("\"symbol\":\"listausdt\""));
     }
 }

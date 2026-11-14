@@ -4,6 +4,7 @@
 //! answer heartbeats, parse, stamp with a nanosecond clock, hand the tick to the
 //! rest of the bot. No trading decisions live here.
 
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -11,11 +12,12 @@ use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use tokio::net::{lookup_host, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tokio_native_tls::TlsStream;
 use tokio_tungstenite::client_async_with_config;
@@ -32,78 +34,102 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the client fails over to the next URL.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Default BTC channels, kept as documentation and used by the frame tests.
-/// The live channels are derived from [`trading_symbol`].
-#[allow(dead_code)]
-pub const DEPTH_CHANNEL: &str = "market.btcusdt.depth.step0";
-#[allow(dead_code)]
-pub const TRADE_CHANNEL: &str = "market.btcusdt.trade.detail";
+/// HTX channel templates. The symbols come from the scanner; there is no
+/// default pair anywhere in the market-data path.
+const DEPTH_TOPIC: &str = "depth.step0";
+const TRADE_TOPIC: &str = "trade.detail";
 
-/// Symbol used when `HTX_SYMBOL` is not set.
-pub const DEFAULT_SYMBOL: &str = "btcusdt";
-
-/// The spot symbol the whole bot trades, from `HTX_SYMBOL` or
-/// [`DEFAULT_SYMBOL`]. HTX channels and REST symbols are lower-case.
-pub fn trading_symbol() -> String {
-    std::env::var("HTX_SYMBOL")
-        .ok()
-        .map(|symbol| symbol.trim().to_ascii_lowercase())
-        .filter(|symbol| !symbol.is_empty())
-        .unwrap_or_else(|| DEFAULT_SYMBOL.to_string())
-}
-
-/// The market-data channels for one symbol.
-#[derive(Debug, Clone)]
-struct Channels {
-    depth: String,
-    trade: String,
-}
-
-impl Channels {
-    fn for_symbol(symbol: &str) -> Self {
-        Self {
-            depth: format!("market.{symbol}.depth.step0"),
-            trade: format!("market.{symbol}.trade.detail"),
-        }
-    }
-
-    fn is_depth(&self, channel: &str) -> bool {
-        channel == self.depth
-    }
-
-    fn is_trade(&self, channel: &str) -> bool {
-        channel == self.trade
-    }
-}
-
-/// Capacity of the WS -> quant channel. If the consumer falls behind, market
+/// Capacity of the WS -> strategy channel. If the consumer falls behind, market
 /// data is dropped rather than the socket being blocked.
-pub const EVENT_BUFFER: usize = 4096;
+pub const EVENT_BUFFER: usize = 8192;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-const DEPTH_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One symbol's two channels.
+fn channel_names(symbol: &str) -> [String; 2] {
+    [
+        format!("market.{symbol}.{DEPTH_TOPIC}"),
+        format!("market.{symbol}.{TRADE_TOPIC}"),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelKind {
+    Trade,
+    Depth,
+}
+
+/// Parses `market.<symbol>.depth.step0` / `market.<symbol>.trade.detail`.
+fn parse_channel(channel: &str) -> Option<(&str, ChannelKind)> {
+    let rest = channel.strip_prefix("market.")?;
+    let (symbol, topic) = rest.split_once('.')?;
+    if symbol.is_empty() {
+        return None;
+    }
+    if topic.starts_with("depth") {
+        Some((symbol, ChannelKind::Depth))
+    } else if topic.starts_with("trade") {
+        Some((symbol, ChannelKind::Trade))
+    } else {
+        None
+    }
+}
+
+/// Per-symbol log throttling: one line per second per pair instead of
+/// thousands of lines a second across a dozen markets.
+#[derive(Debug, Default)]
+struct LogThrottle {
+    last: HashMap<String, Instant>,
+}
+
+impl LogThrottle {
+    fn due(&mut self, key: &str) -> bool {
+        if self.last.len() > 512 {
+            self.last.clear();
+        }
+        let now = Instant::now();
+        match self.last.get(key) {
+            Some(last) if now.duration_since(*last) < LOG_INTERVAL => false,
+            _ => {
+                self.last.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+}
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-/// Events handed to the rest of the bot.
-///
-/// Not every field is read by the current sprint's consumer: timestamps and the
-/// top of book are carried now so the execution layer can use them without a
-/// wire-format change later.
+type WsStream = WebSocketStream<TlsStream<TcpStream>>;
+type WsSink = SplitSink<WsStream, Message>;
+
+/// Events handed to the rest of the bot. Every event carries the symbol that
+/// produced it, so one socket can feed a dozen isolated books.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
     Trade {
+        symbol: String,
         price: Decimal,
         exchange_ts_ms: i64,
         received_ns: u128,
     },
     Depth {
+        symbol: String,
         best_bid: Option<Decimal>,
         best_ask: Option<Decimal>,
         exchange_ts_ms: i64,
         received_ns: u128,
     },
+}
+
+impl MarketEvent {
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Trade { symbol, .. } | Self::Depth { symbol, .. } => symbol,
+        }
+    }
 }
 
 /// A parsed `wss://host[:port]/path` endpoint.
@@ -174,29 +200,54 @@ fn configured_endpoints() -> Vec<Endpoint> {
         .collect()
 }
 
-/// Connects to HTX and keeps the socket alive forever. On a stalled endpoint
-/// the client rotates to the next one, so the bot is never pinned to a silent
-/// edge.
-pub async fn run_websocket(tx: mpsc::Sender<MarketEvent>) {
+/// Connects to HTX and keeps the socket alive forever. The symbol watchlist is
+/// driven by the scanner: subscriptions are added and removed live, and a
+/// reconnect re-subscribes to whatever the list is at that moment.
+pub async fn run_market_stream(
+    tx: mpsc::Sender<MarketEvent>,
+    mut symbols: watch::Receiver<Vec<String>>,
+) {
     let endpoints = configured_endpoints();
     if endpoints.is_empty() {
         eprintln!("[WS] no usable endpoints; market data is disabled");
         return;
     }
 
-    let mut index = 0;
     loop {
-        let endpoint = &endpoints[index % endpoints.len()];
-        match connect_and_stream(endpoint, &tx).await {
-            Ok(()) => eprintln!("[WS] {} stream ended", endpoint.url),
-            Err(err) => eprintln!("[WS] {}: {err}", endpoint.url),
+        // Nothing to subscribe to yet: wait for the scanner without opening a
+        // socket that would only exchange heartbeats.
+        let mut waiting_logged = false;
+        while symbols.borrow().is_empty() {
+            if !waiting_logged {
+                println!("[WS] waiting for the scanner to select pairs…");
+                waiting_logged = true;
+            }
+            if symbols.changed().await.is_err() {
+                return;
+            }
         }
 
-        if endpoints.len() > 1 {
-            index = (index + 1) % endpoints.len();
+        let mut index = 0;
+        loop {
+            let endpoint = &endpoints[index % endpoints.len()];
+            match connect_and_stream(endpoint, &tx, &mut symbols).await {
+                Ok(()) => eprintln!("[WS] {} stream ended", endpoint.url),
+                Err(err) => eprintln!("[WS] {}: {err}", endpoint.url),
+            }
+
+            if symbols.has_changed().is_err() {
+                return;
+            }
+            if symbols.borrow().is_empty() {
+                break;
+            }
+
+            if endpoints.len() > 1 {
+                index = (index + 1) % endpoints.len();
+            }
+            eprintln!("[WS] reconnecting in {}s", RECONNECT_DELAY.as_secs());
+            sleep(RECONNECT_DELAY).await;
         }
-        eprintln!("[WS] reconnecting in {}s", RECONNECT_DELAY.as_secs());
-        sleep(RECONNECT_DELAY).await;
     }
 }
 
@@ -258,104 +309,159 @@ async fn open_socket(
 async fn connect_and_stream(
     endpoint: &Endpoint,
     tx: &mpsc::Sender<MarketEvent>,
+    symbols: &mut watch::Receiver<Vec<String>>,
 ) -> Result<(), BoxError> {
-    let mut socket = open_socket(endpoint).await?;
+    let socket = open_socket(endpoint).await?;
+    let (mut sink, mut source) = socket.split();
 
-    let symbol = trading_symbol();
-    let channels = Channels::for_symbol(&symbol);
-    println!("[WS] market: {symbol}");
+    let mut subscribed: BTreeSet<String> = BTreeSet::new();
+    let initial: Vec<String> = symbols.borrow().iter().cloned().collect();
+    apply_subscriptions(&mut sink, &initial, true).await?;
+    subscribed.extend(initial);
+    println!(
+        "[WS] streaming {} symbols over one socket",
+        subscribed.len()
+    );
 
-    for (id, channel) in [
-        ("depth", channels.depth.as_str()),
-        ("trade", channels.trade.as_str()),
-    ] {
-        let request = json!({ "sub": channel, "id": id });
-        socket.send(Message::Text(request.to_string())).await?;
-        println!("[WS] subscribed: {channel}");
-    }
-
-    let mut last_depth_log = Instant::now() - DEPTH_LOG_INTERVAL;
+    let mut throttle = LogThrottle::default();
 
     loop {
-        let message = match timeout(READ_TIMEOUT, socket.next()).await {
-            Ok(Some(frame)) => frame?,
-            Ok(None) => break,
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "no frames for {}s (endpoint is silent)",
-                        READ_TIMEOUT.as_secs()
-                    ),
-                )
-                .into())
-            }
-        };
-
-        let payload = match message {
-            Message::Text(text) => text,
-            Message::Binary(bytes) => match decompress(&bytes) {
-                Ok(text) => text,
-                Err(err) => {
-                    eprintln!("[WS] gzip decode failed: {err}");
+        tokio::select! {
+            biased;
+            changed = symbols.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let desired: BTreeSet<String> = symbols.borrow().iter().cloned().collect();
+                let added: Vec<String> = desired.difference(&subscribed).cloned().collect();
+                let removed: Vec<String> = subscribed.difference(&desired).cloned().collect();
+                if added.is_empty() && removed.is_empty() {
                     continue;
                 }
-            },
-            Message::Ping(payload) => {
-                socket.send(Message::Pong(payload)).await?;
-                continue;
-            }
-            Message::Close(frame) => {
-                println!("[WS] closed by server: {frame:?}");
-                break;
-            }
-            Message::Pong(_) | Message::Frame(_) => continue,
-        };
 
-        let value: Value = match serde_json::from_str(&payload) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("[WS] bad JSON frame: {err}");
-                continue;
+                apply_subscriptions(&mut sink, &removed, false).await?;
+                for symbol in &removed {
+                    subscribed.remove(symbol);
+                }
+                apply_subscriptions(&mut sink, &added, true).await?;
+                subscribed.extend(added);
+                println!("[WS] watchlist updated: {} symbols", subscribed.len());
             }
-        };
+            message = timeout(READ_TIMEOUT, source.next()) => {
+                let message = match message {
+                    Ok(Some(frame)) => frame?,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "no frames for {}s (endpoint is silent)",
+                                READ_TIMEOUT.as_secs()
+                            ),
+                        )
+                        .into())
+                    }
+                };
 
-        // HTX heartbeat: {"ping": 123456}. Without an immediate pong the
-        // server drops the connection.
-        if let Some(ping) = value.get("ping") {
-            socket
-                .send(Message::Text(json!({ "pong": ping }).to_string()))
-                .await?;
-            continue;
+                let payload = match message {
+                    Message::Text(text) => text,
+                    Message::Binary(bytes) => match decompress(&bytes) {
+                        Ok(text) => text,
+                        Err(err) => {
+                            eprintln!("[WS] gzip decode failed: {err}");
+                            continue;
+                        }
+                    },
+                    Message::Ping(payload) => {
+                        sink.send(Message::Pong(payload)).await?;
+                        continue;
+                    }
+                    Message::Close(frame) => {
+                        println!("[WS] closed by server: {frame:?}");
+                        break;
+                    }
+                    Message::Pong(_) | Message::Frame(_) => continue,
+                };
+
+                let value: Value = match serde_json::from_str(&payload) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("[WS] bad JSON frame: {err}");
+                        continue;
+                    }
+                };
+
+                // HTX heartbeat: {"ping": 123456}. Without an immediate pong
+                // the server drops the connection.
+                if let Some(ping) = value.get("ping") {
+                    sink.send(Message::Text(json!({ "pong": ping }).to_string()))
+                        .await?;
+                    continue;
+                }
+
+                route_payload(&value, tx, &mut throttle);
+            }
         }
-
-        route_payload(&value, &channels, tx, &mut last_depth_log);
     }
 
     Ok(())
 }
 
-fn route_payload(
-    value: &Value,
-    channels: &Channels,
-    tx: &mpsc::Sender<MarketEvent>,
-    last_depth_log: &mut Instant,
-) {
-    let channel = value.get("ch").and_then(Value::as_str).unwrap_or_default();
+/// Subscribes or unsubscribes both channels of every symbol.
+async fn apply_subscriptions(
+    sink: &mut WsSink,
+    symbols: &[String],
+    subscribe: bool,
+) -> Result<(), BoxError> {
+    for symbol in symbols {
+        for channel in channel_names(symbol) {
+            let id = format!("{}-{channel}", if subscribe { "sub" } else { "unsub" });
+            let request = if subscribe {
+                json!({ "sub": channel, "id": id })
+            } else {
+                json!({ "unsub": channel, "id": id })
+            };
+            sink.send(Message::Text(request.to_string())).await?;
+            println!(
+                "[WS] {} {channel}",
+                if subscribe {
+                    "subscribed:"
+                } else {
+                    "unsubscribed:"
+                }
+            );
+        }
+    }
+    Ok(())
+}
 
-    if channels.is_trade(channel) {
-        handle_trades(value, tx);
-    } else if channels.is_depth(channel) {
-        handle_depth(value, tx, last_depth_log);
-    } else if value.get("status").and_then(Value::as_str) == Some("ok") {
-        let subbed = value.get("subbed").and_then(Value::as_str).unwrap_or("?");
-        println!("[WS] subscription confirmed: {subbed}");
+fn route_payload(value: &Value, tx: &mpsc::Sender<MarketEvent>, throttle: &mut LogThrottle) {
+    if let Some(channel) = value.get("ch").and_then(Value::as_str) {
+        if let Some((symbol, kind)) = parse_channel(channel) {
+            match kind {
+                ChannelKind::Trade => handle_trades(value, symbol, tx, throttle),
+                ChannelKind::Depth => handle_depth(value, symbol, tx, throttle),
+            }
+            return;
+        }
+    }
+
+    if value.get("status").and_then(Value::as_str) == Some("ok") {
+        if let Some(subbed) = value.get("subbed").and_then(Value::as_str) {
+            println!("[WS] subscription confirmed: {subbed}");
+        } else if let Some(unsubbed) = value.get("unsubbed").and_then(Value::as_str) {
+            println!("[WS] unsubscription confirmed: {unsubbed}");
+        }
     }
 }
 
-/// Prints every trade with a local UNIX-nanosecond stamp and forwards it to the
-/// quant core.
-fn handle_trades(value: &Value, tx: &mpsc::Sender<MarketEvent>) {
+/// Forwards every print and logs one line per second per symbol.
+fn handle_trades(
+    value: &Value,
+    symbol: &str,
+    tx: &mpsc::Sender<MarketEvent>,
+    throttle: &mut LogThrottle,
+) {
     let Some(tick) = value.get("tick") else {
         return;
     };
@@ -377,17 +483,25 @@ fn handle_trades(value: &Value, tx: &mpsc::Sender<MarketEvent>) {
             .and_then(Value::as_i64)
             .unwrap_or(message_ts);
         let received_ns = unix_nanos();
-        let latency_ms = if exchange_ts_ms > 0 {
-            (received_ns / 1_000_000) as i64 - exchange_ts_ms
-        } else {
-            0
-        };
 
-        println!("[TICK] Price: {price} | Time: {received_ns} | Latency: {latency_ms}ms");
+        if throttle.due(&format!("trade:{symbol}")) {
+            let latency_ms = if exchange_ts_ms > 0 {
+                (received_ns / 1_000_000) as i64 - exchange_ts_ms
+            } else {
+                0
+            };
+            println!(
+                "[TICK] {} price={} latency={}ms",
+                symbol.to_uppercase(),
+                price,
+                latency_ms
+            );
+        }
 
         // Historical trade-detail frames may contain several prints; forward
         // every one of them, and drop rather than block if the consumer stalls.
         let _ = tx.try_send(MarketEvent::Trade {
+            symbol: symbol.to_string(),
             price,
             exchange_ts_ms,
             received_ns,
@@ -396,9 +510,14 @@ fn handle_trades(value: &Value, tx: &mpsc::Sender<MarketEvent>) {
 }
 
 /// Tracks the top of book. Depth arrives far too often for line-per-frame
-/// logging, so the console output is throttled to once a second; every frame is
-/// still forwarded to the bot.
-fn handle_depth(value: &Value, tx: &mpsc::Sender<MarketEvent>, last_depth_log: &mut Instant) {
+/// logging, so the console output is throttled to once a second per symbol;
+/// every frame is still forwarded to the bot.
+fn handle_depth(
+    value: &Value,
+    symbol: &str,
+    tx: &mpsc::Sender<MarketEvent>,
+    throttle: &mut LogThrottle,
+) {
     let Some(tick) = value.get("tick") else {
         return;
     };
@@ -411,16 +530,17 @@ fn handle_depth(value: &Value, tx: &mpsc::Sender<MarketEvent>, last_depth_log: &
     let best_ask = first_level_price(tick.get("asks"));
     let received_ns = unix_nanos();
 
-    if last_depth_log.elapsed() >= DEPTH_LOG_INTERVAL {
+    if throttle.due(&format!("depth:{symbol}")) {
         println!(
-            "[DEPTH] bid={} ask={} | Time: {received_ns}",
+            "[DEPTH] {} bid={} ask={}",
+            symbol.to_uppercase(),
             price_text(best_bid),
             price_text(best_ask)
         );
-        *last_depth_log = Instant::now();
     }
 
     let _ = tx.try_send(MarketEvent::Depth {
+        symbol: symbol.to_string(),
         best_bid,
         best_ask,
         exchange_ts_ms,
@@ -507,7 +627,7 @@ mod tests {
     #[test]
     fn parses_htx_trade_tick_as_decimal() {
         let payload = serde_json::json!({
-            "ch": TRADE_CHANNEL,
+            "ch": "market.btcusdt.trade.detail",
             "ts": 1_763_112_345_678i64,
             "tick": {
                 "id": 7,
@@ -523,16 +643,17 @@ mod tests {
         });
 
         let (tx, mut rx) = mpsc::channel(8);
-        let channels = Channels::for_symbol("btcusdt");
-        let mut last_depth_log = Instant::now();
-        route_payload(&payload, &channels, &tx, &mut last_depth_log);
+        let mut throttle = LogThrottle::default();
+        route_payload(&payload, &tx, &mut throttle);
 
         match rx.try_recv().expect("trade event must be forwarded") {
             MarketEvent::Trade {
+                symbol,
                 price,
                 exchange_ts_ms,
                 ..
             } => {
+                assert_eq!(symbol, "btcusdt");
                 assert_eq!(price, Decimal::from_str("96553.12").unwrap());
                 assert_eq!(exchange_ts_ms, 1_763_112_345_600);
             }
@@ -543,7 +664,7 @@ mod tests {
     #[test]
     fn parses_depth_top_of_book() {
         let payload = serde_json::json!({
-            "ch": DEPTH_CHANNEL,
+            "ch": "market.listausdt.depth.step0",
             "tick": {
                 "ts": 1_763_112_345_678i64,
                 "bids": [["96553.12", "0.5"]],
@@ -552,14 +673,17 @@ mod tests {
         });
 
         let (tx, mut rx) = mpsc::channel(8);
-        let channels = Channels::for_symbol("btcusdt");
-        let mut last_depth_log = Instant::now() - DEPTH_LOG_INTERVAL;
-        route_payload(&payload, &channels, &tx, &mut last_depth_log);
+        let mut throttle = LogThrottle::default();
+        route_payload(&payload, &tx, &mut throttle);
 
         match rx.try_recv().expect("depth event must be forwarded") {
             MarketEvent::Depth {
-                best_bid, best_ask, ..
+                symbol,
+                best_bid,
+                best_ask,
+                ..
             } => {
+                assert_eq!(symbol, "listausdt");
                 assert_eq!(best_bid, Some(Decimal::from_str("96553.12").unwrap()));
                 assert_eq!(best_ask, Some(Decimal::from_str("96553.99").unwrap()));
             }
@@ -568,13 +692,29 @@ mod tests {
     }
 
     #[test]
-    fn channels_are_derived_from_the_trading_symbol() {
-        let channels = Channels::for_symbol(DEFAULT_SYMBOL);
-        assert_eq!(channels.depth, DEPTH_CHANNEL);
-        assert_eq!(channels.trade, TRADE_CHANNEL);
-        assert!(channels.is_depth(DEPTH_CHANNEL));
-        assert!(channels.is_trade(TRADE_CHANNEL));
-        assert!(!channels.is_trade(DEPTH_CHANNEL));
+    fn channel_names_are_built_per_scanned_symbol() {
+        let channels = channel_names("listausdt");
+        assert_eq!(channels[0], "market.listausdt.depth.step0");
+        assert_eq!(channels[1], "market.listausdt.trade.detail");
+
+        assert_eq!(
+            parse_channel("market.listausdt.depth.step0"),
+            Some(("listausdt", ChannelKind::Depth))
+        );
+        assert_eq!(
+            parse_channel("market.listausdt.trade.detail"),
+            Some(("listausdt", ChannelKind::Trade))
+        );
+        assert_eq!(parse_channel("market.listausdt.kline.1min"), None);
+        assert_eq!(parse_channel("notifications"), None);
+    }
+
+    #[test]
+    fn log_throttle_limits_per_symbol_output() {
+        let mut throttle = LogThrottle::default();
+        assert!(throttle.due("trade:btcusdt"));
+        assert!(!throttle.due("trade:btcusdt"));
+        assert!(throttle.due("trade:listausdt"));
     }
 
     #[test]

@@ -1,32 +1,61 @@
 # ENRG-HFT
 
-Hybrid scalping bot — four layers, one binary.
+Hybrid **multi-pair** scalping bot — six layers, one binary.
 
 | Layer | Module | Responsibility |
 | --- | --- | --- |
-| 1. Fast hands | `src/exchange/htx.rs` | HTX WebSocket (`wss://api.htx.com/ws`, fallback `wss://api.huobi.pro/ws`): IPv4-only dial, gzip decoding, heartbeat, depth/trade subscriptions, nanosecond tick stamps, 15s stall watchdog and automatic reconnect. Symbol comes from `HTX_SYMBOL`. |
+| 0.5 Scanner | `src/scanner.rs` | Every `SCAN_INTERVAL_SECS` pulls `GET /market/tickers`, keeps liquid USDT spot pairs (24h quote volume ≥ `SCAN_MIN_QUOTE_VOLUME_USDT`), drops stablecoins and leveraged tokens, ranks the rest by 24h amplitude and reads per-pair `amount-precision` / `price-precision` from `/v1/common/symbols`. |
+| 1. Fast hands | `src/exchange/htx.rs` | One HTX WebSocket (`wss://api.htx.com/ws`, fallback `wss://api.huobi.pro/ws`) for **all** scanned pairs: IPv4-only dial, gzip decoding, heartbeat, live `sub`/`unsub` as the watchlist rotates, per-symbol throttled logs, 15s stall watchdog and automatic reconnect. |
 | 2. Mathematics | `src/quant_core.rs` | Exact `Decimal` anomaly detection: more than 1% price move inside the last 10 ticks. |
-| 2.5 Strategy | `src/strategy.rs` | Rolling window, top of book, anomaly cooldown, directional `Signal`, and the shared `MarketSnapshot` read by the AI and the executor. |
-| 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager, strict `{"action":"TRADE"\|"PAUSE","reason":"..."}` contract, polled every `AI_INTERVAL_SECS`. |
-| 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders. |
+| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, directional `Signal { symbol, side, price, … }`, and the multi-pair context read by DeepSeek and the executor. |
+| 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager with a strict `{"action":"TRADE"\|"PAUSE","symbol":"…","reason":"…"}` contract, polled every `AI_INTERVAL_SECS`. |
+| 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders **on the pair the AI selected**. |
 
-The AI is a **gate**, not a signal: a `TRADE` verdict opens the gate for
-`EXEC_GATE_TTL_SECS`; the quant signal decides *when* and in which direction
-(momentum across the anomaly window). A stale verdict, a `PAUSE`, or a missing
-DeepSeek key keeps entries disabled while the bot keeps streaming data.
+The AI is a **gate and a pair selector**, not a signal: a `TRADE` verdict opens
+the gate for exactly one symbol for `EXEC_GATE_TTL_SECS`; the quant signal on
+that symbol decides *when* and in which direction (momentum across the anomaly
+window). A stale verdict, a `PAUSE`, a symbol outside the scanner watchlist or a
+missing DeepSeek key keeps entries disabled while the bot keeps streaming data.
+
+## Market scanner
+
+There is no default `btcusdt`. The scanner ranks the whole HTX spot board by
+24h range `(high - low) / low` and streams the top `SCAN_TOP_N` pairs:
+
+```text
+[SCAN] found 12 active pairs (ranked by 24h amplitude):
+[SCAN]  1. LISTAUSDT last=0.1300 chg=30.00% amp=40.00% vol=4200000 spread=15bps
+[SCAN]  2. FUNUSDT last=0.0020 chg=17.65% amp=31.25% vol=2500000 spread=10bps
+...
+```
+
+Filters: non-USDT markets, stablecoin bases (`usdc`, `dai`, `usdd`, …),
+leveraged tokens (`*3l`, `*3s`, `*5l`, `*5s`, …), anything below the volume
+floor and anything whose quoted spread is wider than `SCAN_MAX_SPREAD_BPS`
+(150 bps by default) are discarded. `SCAN_SYMBOLS` can pin extra pairs
+(comma-separated), which bypass the volume and spread filters — handy for
+debugging one market.
+
+At every rescan the WebSocket subscription list is diffed: new pairs are
+`sub`scribed, dropped pairs are `unsub`scribed, and a reconnect always restores
+the current list. If the scanner rotates out a pair that still has an open
+position, the executor **pins** that symbol so its book keeps streaming until
+the position is flat.
 
 ## Execution flow
 
 ```text
-WS tick ──> Strategy ──> Signal ─────────────┐
-                                             v
-DeepSeek ──> Verdict ────────────────> AI gate (TRADE + fresh?)
-                                             v
-                                   RiskGuard (size, notional, cooldown, daily loss)
-                                             v
-                                   Broker (paper | HTX REST)
-                                             v
-                            Portfolio/PnL ──> TP / SL / timeout ──> exit order
+REST tickers ──> Scanner ──> watchlist ──> per-symbol WS subscriptions
+                                              │
+WS tick ──> MarketBoard book ──> Signal(symbol) ─┐
+                                                 v
+DeepSeek ──> Verdict(action, symbol) ──> AI gate (TRADE + fresh + symbol matches?)
+                                                 v
+                                       RiskGuard (size, notional, cooldown, daily loss)
+                                                 v
+                                       Broker (paper | HTX REST) on that pair
+                                                 v
+                              Portfolio/PnL ──> TP / SL / timeout ──> exit order
 ```
 
 - **Paper mode** (default) fills marketable limits at the live touch and rests
@@ -41,8 +70,9 @@ DeepSeek ──> Verdict ────────────────> AI ga
   the position is flattened with one aggressive order and a final report is
   printed.
 
+
 Spot only: sell entries with a flat book are rejected, so the bot never opens a
-short the venue would refuse.
+short the venue would refuse. One position at a time across all pairs.
 
 ## Risk model
 
@@ -71,9 +101,19 @@ EXECUTION_MODE=paper   # off | paper | live
 ```
 
 `live` refuses to start without `HTX_API_KEY` / `HTX_API_SECRET` — it never
-silently downgrades to paper. `HTX_SYMBOL` (default `btcusdt`) drives market
-data, order symbols, base-step filtering and the AI context. Full list of
-knobs: `.env.example`.
+silently downgrades to paper. Market selection is fully automatic:
+
+```dotenv
+SCAN_INTERVAL_SECS=90
+SCAN_MIN_QUOTE_VOLUME_USDT=1000000
+SCAN_MAX_SPREAD_BPS=150
+SCAN_TOP_N=12
+# SCAN_SYMBOLS=btcusdt     # optional extra pins
+```
+
+Order sizing uses each pair's venue precision from HTX metadata;
+`EXEC_BASE_STEP` / `EXEC_PRICE_STEP` are only fallbacks for symbols missing from
+`/v1/common/symbols`. Full list of knobs: `.env.example`.
 
 ## Run
 
@@ -82,39 +122,53 @@ cargo build --release
 cargo run --release
 ```
 
-Expected console output (paper mode):
+Expected console output (paper mode, abridged):
 
 ```text
 [BOOT] enrg-hft 0.1.0 starting
-[BOOT] symbol=btcusdt execution=paper order_notional=25USDT paper_cash=1000USDT
+[BOOT] scanner: every 90s, min 24h volume 1000000USDT, top 12 pairs
+[BOOT] execution=paper order_notional=25USDT paper_cash=1000USDT
+[SCAN] found 12 active pairs (ranked by 24h amplitude):
+[SCAN]  1. LISTAUSDT last=0.1300 chg=30.00% amp=40.00% vol=4200000
+...
 [WS] connected to wss://api.htx.com/ws over IPv4 (HTTP 101 Switching Protocols)
-[WS] market: btcusdt
-[WS] subscribed: market.btcusdt.depth.step0
-[WS] subscribed: market.btcusdt.trade.detail
-[EXEC] mode=paper symbol=btcusdt order_notional=25USDT tp=0.8% sl=0.5% max_hold=120s gate_ttl=120s
-[AI] 2026-11-14 16:27:00 UTC asking DeepSeek: symbol=btcusdt last=65447.0 ...
-[AI] 2026-11-14 16:27:02 UTC decision: TRADE — spread is tight, volatility expanding
-[EXEC] AI gate TRADE — spread is tight, volatility expanding
-[SIGNAL] BUY 65610.5 (1.21%) — >1% range in the last 10 ticks
-[EXEC] placing BUY 0.00038 btcusdt @ 65643.32 (signal: >1% range in the last 10 ticks)
+[WS] subscribed: market.listausdt.depth.step0
+[WS] subscribed: market.listausdt.trade.detail
+...
+[WS] streaming 12 symbols over one socket
+[EXEC] mode=paper pairs=12 order_notional=25USDT tp=0.8% sl=0.5% max_hold=120s gate_ttl=120s
+[TICK] LISTAUSDT price=0.1302 latency=41ms
+[DEPTH] FUNUSDT bid=0.001997 ask=0.002003
+[AI] 2026-11-14 16:27:00 UTC asking DeepSeek about 12 pairs:
+watchlist:
+1. LISTAUSDT last=0.1302 bid=0.1301 ask=0.1302 spread=7.7bps chg24=30% amp24=40% vol24=4200000 anomaly=yes
+...
+account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
+[AI] 2026-11-14 16:27:02 UTC decision: TRADE LISTAUSDT — momentum and acceptable spread
+[EXEC] AI gate TRADE LISTAUSDT — momentum and acceptable spread
+[SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) — >1% range in the last 10 ticks
+[EXEC] placing BUY 191.7 LISTAUSDT @ 0.1305 (signal: >1% range in the last 10 ticks)
 [EXEC] order paper-1 accepted: filled
-[EXEC] entry fill 0.00038 btcusdt @ 65610.5 (fee 0.004986)
-[EXEC] closing position: SELL 0.00038 @ 66130.0 — take-profit (pnl 0.792%)
-[EXEC] exit fill 0.00038 btcusdt @ 66130.0 (fee 0.005026)
-[EXEC] trade #1 closed: net 0.1875 USDT (1 of 1 winners)
+[EXEC] entry fill 191.7 LISTAUSDT @ 0.1305 (fee 0.0500)
+[EXEC] closing position: SELL 191.7 LISTAUSDT @ 0.1316 — take-profit (pnl 0.84%)
+[EXEC] exit fill 191.7 LISTAUSDT @ 0.1316 (fee 0.0504)
+[EXEC] trade #1 closed: net 0.1105 USDT (1 of 1 winners)
 ```
 
 ## Safety notes
 
 - Default mode is `paper`; live trading is an explicit opt-in.
-- Order amounts are rounded **down** to `EXEC_BASE_STEP`, never above the
+- The AI can only open the pair it named, and only if that pair is on the
+  scanner watchlist; a hallucinated ticker is rejected and logged.
+- Order amounts are rounded **down** to the pair's base step, never above the
   configured notional.
-- Prices are rounded **outward** to `EXEC_PRICE_STEP`, so an "aggressive" limit
-  actually crosses the touch.
+- Prices are rounded **outward** to the pair's price step, so an "aggressive"
+  limit actually crosses the touch.
 - A missing or failing DeepSeek key leaves the gate closed: no entries, but the
   market feed, risk guard and positions remain live.
-- The executor never blocks the socket: it reads a `watch` snapshot and trades
-  from its own task.
+- The executor never blocks the socket: it reads only the books of its own
+  working order / open position from the shared board and trades from its own
+  task.
 
 ## Tests
 
@@ -122,8 +176,10 @@ Expected console output (paper mode):
 cargo test
 ```
 
-80 unit tests, no network required: Decimal anomaly windows, DeepSeek JSON
-normalisation, HTX frame parsing/gzip, request signing against an independent
-golden vector, order/balance parsers, portfolio PnL, every risk rejection, the
-paper broker's fill semantics, sizing/rounding helpers and a full paper
-round-trip through the executor.
+96 unit tests, no network required: Decimal anomaly windows, scanner filtering
+and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
+normalisation with symbol selection, HTX frame parsing/gzip/channel routing,
+request signing against an independent golden vector, order/balance parsers,
+portfolio PnL, every risk rejection, the paper broker's fill semantics and
+symbol isolation, sizing/rounding helpers and full paper round-trips through the
+multi-pair executor.
