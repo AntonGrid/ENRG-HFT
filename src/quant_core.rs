@@ -103,12 +103,12 @@ mod tests {
     fn only_the_last_ten_ticks_are_measured() {
         // The 10% jump is outside the window: the last ten ticks are flat.
         let mut prices = vec![dec("90")];
-        prices.extend(std::iter::repeat(dec("100")).take(ANOMALY_WINDOW_TICKS));
+        prices.extend(std::iter::repeat_n(dec("100"), ANOMALY_WINDOW_TICKS));
         assert!(!detect_anomaly(&prices));
 
         // The same jump inside the window is detected.
         let mut prices = vec![dec("100")];
-        prices.extend(std::iter::repeat(dec("110")).take(ANOMALY_WINDOW_TICKS - 1));
+        prices.extend(std::iter::repeat_n(dec("110"), ANOMALY_WINDOW_TICKS - 1));
         assert!(detect_anomaly(&prices));
     }
 

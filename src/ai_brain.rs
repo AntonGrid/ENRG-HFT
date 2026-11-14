@@ -59,8 +59,11 @@ struct ChatMessage {
 /// Asks DeepSeek for a risk verdict on `context`.
 ///
 /// The API key is read from `DEEPSEEK_API_KEY` on every call so a rotated key in
-/// the environment is picked up without a restart.
-pub async fn ask_deepseek(context: &str) -> Result<AiDecision, Box<dyn std::error::Error>> {
+/// the environment is picked up without a restart. The error type is
+/// `Send + Sync` because the call is driven from a spawned task.
+pub async fn ask_deepseek(
+    context: &str,
+) -> Result<AiDecision, Box<dyn std::error::Error + Send + Sync>> {
     let api_key = std::env::var("DEEPSEEK_API_KEY")?;
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -86,10 +89,10 @@ pub async fn ask_deepseek(context: &str) -> Result<AiDecision, Box<dyn std::erro
     let status = response.status();
     let body = response.text().await?;
     if !status.is_success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("DeepSeek HTTP {status}: {}", truncate(&body, 400)),
-        )
+        return Err(std::io::Error::other(format!(
+            "DeepSeek HTTP {status}: {}",
+            truncate(&body, 400)
+        ))
         .into());
     }
 

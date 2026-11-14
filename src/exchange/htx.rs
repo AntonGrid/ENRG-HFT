@@ -32,8 +32,49 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the client fails over to the next URL.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Default BTC channels, kept as documentation and used by the frame tests.
+/// The live channels are derived from [`trading_symbol`].
+#[allow(dead_code)]
 pub const DEPTH_CHANNEL: &str = "market.btcusdt.depth.step0";
+#[allow(dead_code)]
 pub const TRADE_CHANNEL: &str = "market.btcusdt.trade.detail";
+
+/// Symbol used when `HTX_SYMBOL` is not set.
+pub const DEFAULT_SYMBOL: &str = "btcusdt";
+
+/// The spot symbol the whole bot trades, from `HTX_SYMBOL` or
+/// [`DEFAULT_SYMBOL`]. HTX channels and REST symbols are lower-case.
+pub fn trading_symbol() -> String {
+    std::env::var("HTX_SYMBOL")
+        .ok()
+        .map(|symbol| symbol.trim().to_ascii_lowercase())
+        .filter(|symbol| !symbol.is_empty())
+        .unwrap_or_else(|| DEFAULT_SYMBOL.to_string())
+}
+
+/// The market-data channels for one symbol.
+#[derive(Debug, Clone)]
+struct Channels {
+    depth: String,
+    trade: String,
+}
+
+impl Channels {
+    fn for_symbol(symbol: &str) -> Self {
+        Self {
+            depth: format!("market.{symbol}.depth.step0"),
+            trade: format!("market.{symbol}.trade.detail"),
+        }
+    }
+
+    fn is_depth(&self, channel: &str) -> bool {
+        channel == self.depth
+    }
+
+    fn is_trade(&self, channel: &str) -> bool {
+        channel == self.trade
+    }
+}
 
 /// Capacity of the WS -> quant channel. If the consumer falls behind, market
 /// data is dropped rather than the socket being blocked.
@@ -220,7 +261,14 @@ async fn connect_and_stream(
 ) -> Result<(), BoxError> {
     let mut socket = open_socket(endpoint).await?;
 
-    for (id, channel) in [("depth", DEPTH_CHANNEL), ("trade", TRADE_CHANNEL)] {
+    let symbol = trading_symbol();
+    let channels = Channels::for_symbol(&symbol);
+    println!("[WS] market: {symbol}");
+
+    for (id, channel) in [
+        ("depth", channels.depth.as_str()),
+        ("trade", channels.trade.as_str()),
+    ] {
         let request = json!({ "sub": channel, "id": id });
         socket.send(Message::Text(request.to_string())).await?;
         println!("[WS] subscribed: {channel}");
@@ -281,18 +329,23 @@ async fn connect_and_stream(
             continue;
         }
 
-        route_payload(&value, tx, &mut last_depth_log);
+        route_payload(&value, &channels, tx, &mut last_depth_log);
     }
 
     Ok(())
 }
 
-fn route_payload(value: &Value, tx: &mpsc::Sender<MarketEvent>, last_depth_log: &mut Instant) {
+fn route_payload(
+    value: &Value,
+    channels: &Channels,
+    tx: &mpsc::Sender<MarketEvent>,
+    last_depth_log: &mut Instant,
+) {
     let channel = value.get("ch").and_then(Value::as_str).unwrap_or_default();
 
-    if channel == TRADE_CHANNEL {
+    if channels.is_trade(channel) {
         handle_trades(value, tx);
-    } else if channel == DEPTH_CHANNEL {
+    } else if channels.is_depth(channel) {
         handle_depth(value, tx, last_depth_log);
     } else if value.get("status").and_then(Value::as_str) == Some("ok") {
         let subbed = value.get("subbed").and_then(Value::as_str).unwrap_or("?");
@@ -470,8 +523,9 @@ mod tests {
         });
 
         let (tx, mut rx) = mpsc::channel(8);
+        let channels = Channels::for_symbol("btcusdt");
         let mut last_depth_log = Instant::now();
-        route_payload(&payload, &tx, &mut last_depth_log);
+        route_payload(&payload, &channels, &tx, &mut last_depth_log);
 
         match rx.try_recv().expect("trade event must be forwarded") {
             MarketEvent::Trade {
@@ -498,8 +552,9 @@ mod tests {
         });
 
         let (tx, mut rx) = mpsc::channel(8);
+        let channels = Channels::for_symbol("btcusdt");
         let mut last_depth_log = Instant::now() - DEPTH_LOG_INTERVAL;
-        route_payload(&payload, &tx, &mut last_depth_log);
+        route_payload(&payload, &channels, &tx, &mut last_depth_log);
 
         match rx.try_recv().expect("depth event must be forwarded") {
             MarketEvent::Depth {
@@ -510,6 +565,16 @@ mod tests {
             }
             other => panic!("expected depth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn channels_are_derived_from_the_trading_symbol() {
+        let channels = Channels::for_symbol(DEFAULT_SYMBOL);
+        assert_eq!(channels.depth, DEPTH_CHANNEL);
+        assert_eq!(channels.trade, TRADE_CHANNEL);
+        assert!(channels.is_depth(DEPTH_CHANNEL));
+        assert!(channels.is_trade(TRADE_CHANNEL));
+        assert!(!channels.is_trade(DEPTH_CHANNEL));
     }
 
     #[test]

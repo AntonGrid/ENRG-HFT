@@ -1,0 +1,248 @@
+//! Position and cash accounting.
+//!
+//! The bot is a spot scalper: buys are paid from cash, sells are paid from the
+//! base asset. Average entry, realised and unrealised PnL are all
+//! [`Decimal`]-exact so a long session does not drift by fractions of a cent.
+//!
+//! Fees are charged separately from the fill: the venue reports gross fills, and
+//! the executor subtracts the fee from cash and from the daily result. That
+//! keeps the maths auditable against exchange statements.
+
+use rust_decimal::Decimal;
+
+use crate::execution::Side;
+
+/// A signed open position. `qty > 0` is long, `qty < 0` is short (paper only;
+/// the risk guard forbids short entries on spot).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Position {
+    qty: Decimal,
+    avg_entry: Decimal,
+    realized_pnl: Decimal,
+}
+
+impl Position {
+    pub fn qty(&self) -> Decimal {
+        self.qty
+    }
+
+    pub fn avg_entry(&self) -> Decimal {
+        self.avg_entry
+    }
+
+    /// Gross realised PnL, before fees.
+    pub fn realized_pnl(&self) -> Decimal {
+        self.realized_pnl
+    }
+
+    pub fn is_flat(&self) -> bool {
+        self.qty.is_zero()
+    }
+
+    /// Unrealised PnL at `mark`. Zero for a flat book.
+    pub fn unrealized(&self, mark: Decimal) -> Decimal {
+        if self.is_flat() {
+            Decimal::ZERO
+        } else {
+            (mark - self.avg_entry) * self.qty
+        }
+    }
+
+    /// Absolute exposure at `mark`.
+    pub fn notional(&self, mark: Decimal) -> Decimal {
+        (self.qty * mark).abs()
+    }
+
+    /// Applies a fill and returns the gross realised PnL it produced.
+    ///
+    /// Adding to a position re-weights the average entry. Reducing it realises
+    /// PnL on the closed part; crossing through zero flips the position and
+    /// resets the average entry to the fill price.
+    pub fn apply_fill(&mut self, side: Side, qty: Decimal, price: Decimal) -> Decimal {
+        if qty <= Decimal::ZERO || price <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        let signed = match side {
+            Side::Buy => qty,
+            Side::Sell => -qty,
+        };
+
+        let mut realized = Decimal::ZERO;
+        let old = self.qty;
+
+        if old.is_zero() {
+            self.qty = signed;
+            self.avg_entry = price;
+        } else if (old > Decimal::ZERO) == (side == Side::Buy) {
+            // Adding to the same direction: weighted average entry.
+            let total = old.abs() + qty;
+            self.avg_entry = (self.avg_entry * old.abs() + price * qty) / total;
+            self.qty = old + signed;
+        } else {
+            // Reducing, possibly flipping.
+            let closing = old.abs().min(qty);
+            realized = if old > Decimal::ZERO {
+                (price - self.avg_entry) * closing
+            } else {
+                (self.avg_entry - price) * closing
+            };
+
+            let new_qty = old + signed;
+            if new_qty.is_zero() {
+                self.avg_entry = Decimal::ZERO;
+            } else if (new_qty > Decimal::ZERO) != (old > Decimal::ZERO) {
+                // Flipped: the remainder opened at the fill price.
+                self.avg_entry = price;
+            }
+            self.qty = new_qty;
+        }
+
+        self.realized_pnl += realized;
+        realized
+    }
+}
+
+/// Cash plus base asset plus the open [`Position`].
+#[derive(Debug, Clone)]
+pub struct Portfolio {
+    /// Free quote currency (USDT in paper mode).
+    pub cash: Decimal,
+    pub position: Position,
+    pub fees_paid: Decimal,
+}
+
+impl Portfolio {
+    pub fn new(cash: Decimal) -> Self {
+        Self {
+            cash,
+            position: Position::default(),
+            fees_paid: Decimal::ZERO,
+        }
+    }
+
+    /// Settles a fill against cash and the position; returns gross realised PnL.
+    pub fn apply_fill(&mut self, side: Side, qty: Decimal, price: Decimal) -> Decimal {
+        let cash_delta = qty * price;
+        match side {
+            Side::Buy => self.cash -= cash_delta,
+            Side::Sell => self.cash += cash_delta,
+        }
+        self.position.apply_fill(side, qty, price)
+    }
+
+    /// Deducts a fee from cash and records it.
+    pub fn charge_fee(&mut self, fee: Decimal) {
+        if fee <= Decimal::ZERO {
+            return;
+        }
+        self.cash -= fee;
+        self.fees_paid += fee;
+    }
+
+    /// Mark-to-market equity of the paper book.
+    pub fn equity(&self, mark: Decimal) -> Decimal {
+        self.cash + self.position.qty * mark
+    }
+
+    /// `true` when cash covers the order and its fee.
+    pub fn can_afford(&self, notional: Decimal, fee: Decimal) -> bool {
+        self.cash >= notional + fee
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn dec(value: &str) -> Decimal {
+        Decimal::from_str(value).expect("test value must be a valid decimal")
+    }
+
+    #[test]
+    fn buying_reweights_the_average_entry() {
+        let mut position = Position::default();
+        position.apply_fill(Side::Buy, dec("0.01"), dec("60000"));
+        position.apply_fill(Side::Buy, dec("0.01"), dec("64000"));
+
+        assert_eq!(position.qty(), dec("0.02"));
+        assert_eq!(position.avg_entry(), dec("62000"));
+        assert_eq!(position.realized_pnl(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn selling_part_of_a_long_realises_pnl() {
+        let mut position = Position::default();
+        position.apply_fill(Side::Buy, dec("0.02"), dec("62000"));
+        let realized = position.apply_fill(Side::Sell, dec("0.01"), dec("66000"));
+
+        assert_eq!(realized, dec("40"));
+        assert_eq!(position.qty(), dec("0.01"));
+        assert_eq!(position.avg_entry(), dec("62000"));
+        assert_eq!(position.realized_pnl(), dec("40"));
+    }
+
+    #[test]
+    fn closing_a_long_clears_the_average_entry() {
+        let mut position = Position::default();
+        position.apply_fill(Side::Buy, dec("0.01"), dec("60000"));
+        position.apply_fill(Side::Sell, dec("0.01"), dec("61000"));
+
+        assert!(position.is_flat());
+        assert_eq!(position.avg_entry(), Decimal::ZERO);
+        assert_eq!(position.realized_pnl(), dec("10"));
+    }
+
+    #[test]
+    fn short_position_realises_on_the_way_down() {
+        let mut position = Position::default();
+        position.apply_fill(Side::Sell, dec("0.01"), dec("65000"));
+        let realized = position.apply_fill(Side::Buy, dec("0.01"), dec("64000"));
+
+        assert_eq!(realized, dec("10"));
+        assert!(position.is_flat());
+    }
+
+    #[test]
+    fn flipping_through_zero_resets_the_entry_price() {
+        let mut position = Position::default();
+        position.apply_fill(Side::Buy, dec("0.01"), dec("60000"));
+        position.apply_fill(Side::Sell, dec("0.03"), dec("61000"));
+
+        assert_eq!(position.qty(), dec("-0.02"));
+        assert_eq!(position.avg_entry(), dec("61000"));
+        assert_eq!(position.realized_pnl(), dec("10"));
+    }
+
+    #[test]
+    fn unrealised_pnl_tracks_the_mark() {
+        let mut position = Position::default();
+        position.apply_fill(Side::Buy, dec("0.5"), dec("100"));
+        assert_eq!(position.unrealized(dec("110")), dec("5"));
+        assert_eq!(position.unrealized(dec("90")), dec("-5"));
+        assert_eq!(position.notional(dec("110")), dec("55"));
+    }
+
+    #[test]
+    fn portfolio_moves_cash_and_charges_fees() {
+        let mut portfolio = Portfolio::new(dec("1000"));
+        portfolio.apply_fill(Side::Buy, dec("0.001"), dec("60000"));
+        assert_eq!(portfolio.cash, dec("940"));
+
+        portfolio.apply_fill(Side::Sell, dec("0.001"), dec("61000"));
+        assert_eq!(portfolio.cash, dec("1001"));
+
+        portfolio.charge_fee(dec("0.5"));
+        assert_eq!(portfolio.cash, dec("1000.5"));
+        assert_eq!(portfolio.fees_paid, dec("0.5"));
+        assert_eq!(portfolio.equity(dec("61000")), dec("1000.5"));
+    }
+
+    #[test]
+    fn affordability_includes_the_fee() {
+        let portfolio = Portfolio::new(dec("100"));
+        assert!(portfolio.can_afford(dec("99"), dec("1")));
+        assert!(!portfolio.can_afford(dec("99"), dec("2")));
+    }
+}
