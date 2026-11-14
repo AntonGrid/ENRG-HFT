@@ -15,7 +15,7 @@
 //! [`MarketSnapshot`] for the symbol it is about to trade (or is holding) from
 //! the shared [`MarketBoard`] and only speaks to the exchange from its own task.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ use crate::execution::htx_rest::{Balance, HtxRest};
 use crate::execution::portfolio::Portfolio;
 use crate::execution::risk::{Intent, RiskGuard, RiskLimits};
 use crate::execution::{ExecutionError, OrderReport, OrderRequest, OrderStatus, Side};
+use crate::scanner::{is_tradable_usdt_symbol, normalize_symbol, Scanner, SpotQuote};
 use crate::strategy::{MarketBoard, MarketSnapshot, Signal};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
@@ -40,6 +41,10 @@ const LIVE_STATUS_POLL: Duration = Duration::from_secs(1);
 const LIVE_BALANCE_POLL: Duration = Duration::from_secs(30);
 /// Pause before re-attempting a failed or cancelled exit.
 const EXIT_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// How often a startup liquidation order is re-queried.
+const RECOVERY_FILL_POLL: Duration = Duration::from_millis(500);
+/// How long startup recovery waits for a liquidation order before cancelling.
+const RECOVERY_FILL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What the process is allowed to do with money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +248,87 @@ fn live_entry_notional(configured: Decimal, available: Decimal, fee_rate: Decima
     configured.min(affordable)
 }
 
+/// One non-USDT balance found on the venue at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredHolding {
+    currency: String,
+    symbol: String,
+    qty: Decimal,
+    available: Decimal,
+    mark: Option<Decimal>,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+    base_step: Decimal,
+    price_step: Decimal,
+}
+
+impl RecoveredHolding {
+    fn notional(&self) -> Decimal {
+        self.mark.unwrap_or_default() * self.qty
+    }
+}
+
+/// Turns venue balances into recovery candidates.
+///
+/// USDT is skipped (it is the quote currency, not a position). Every other
+/// positive balance is kept, even when no USDT market exists, so the audit can
+/// report it instead of silently ignoring the asset.
+fn recovery_holdings(
+    balances: &[Balance],
+    quotes: &HashMap<String, SpotQuote>,
+    fallback_base_step: Decimal,
+    fallback_price_step: Decimal,
+) -> Vec<RecoveredHolding> {
+    balances
+        .iter()
+        .filter_map(|balance| {
+            let qty = balance.available + balance.frozen;
+            if qty <= Decimal::ZERO || balance.currency.eq_ignore_ascii_case("USDT") {
+                return None;
+            }
+            let symbol = normalize_symbol(&format!("{}usdt", balance.currency))?;
+            let quote = quotes.get(&symbol);
+            Some(RecoveredHolding {
+                currency: balance.currency.to_ascii_uppercase(),
+                symbol,
+                qty,
+                available: balance.available,
+                mark: quote.and_then(SpotQuote::mark),
+                best_bid: quote.and_then(|quote| quote.best_bid),
+                best_ask: quote.and_then(|quote| quote.best_ask),
+                base_step: quote
+                    .map(|quote| quote.base_step)
+                    .unwrap_or(fallback_base_step),
+                price_step: quote
+                    .map(|quote| quote.price_step)
+                    .unwrap_or(fallback_price_step),
+            })
+        })
+        .collect()
+}
+
+/// Picks the single position to keep under active management.
+///
+/// Spot is long-only and the executor tracks one position, so the largest
+/// balance with a tradable USDT market becomes the position. Everything else is
+/// a candidate for liquidation. Preferences, borrowed tokens and any market
+/// that [`is_tradable_usdt_symbol`] rejects are never adopted as the position.
+fn pick_primary_holding(holdings: &[RecoveredHolding]) -> Option<usize> {
+    holdings
+        .iter()
+        .enumerate()
+        .filter(|(_, holding)| {
+            holding.mark.unwrap_or_default() > Decimal::ZERO
+                && is_tradable_usdt_symbol(&holding.symbol)
+        })
+        .max_by(|(_, left), (_, right)| {
+            left.notional()
+                .cmp(&right.notional())
+                .then_with(|| right.symbol.cmp(&left.symbol))
+        })
+        .map(|(index, _)| index)
+}
+
 /// A read-only view of the account, shared with the AI layer.
 #[derive(Debug, Clone, Default)]
 pub struct AccountView {
@@ -395,6 +481,11 @@ pub struct Executor {
     last_balance_poll: Instant,
     halt_logged: bool,
     account_tx: watch::Sender<AccountView>,
+    /// Scanner used at startup to price and liquidate balances that are not on
+    /// the current watchlist (e.g. a coin bought before a restart).
+    scanner: Option<Arc<Scanner>>,
+    /// Pushes the pinned symbol set to the websocket task after recovery.
+    subscriptions_tx: Option<watch::Sender<Vec<String>>>,
 }
 
 impl Executor {
@@ -450,7 +541,22 @@ impl Executor {
             last_balance_poll: Instant::now(),
             halt_logged: false,
             account_tx,
+            scanner: None,
+            subscriptions_tx: None,
         })
+    }
+
+    /// Supplies market data used by the startup balance audit. Live mode should
+    /// set both the scanner and the subscriptions channel; paper mode can omit
+    /// them because it has no venue balances to recover.
+    pub fn with_balance_recovery(
+        mut self,
+        scanner: Arc<Scanner>,
+        subscriptions_tx: watch::Sender<Vec<String>>,
+    ) -> Self {
+        self.scanner = Some(scanner);
+        self.subscriptions_tx = Some(subscriptions_tx);
+        self
     }
 
     fn board(&self) -> RwLockReadGuard<'_, MarketBoard> {
@@ -475,9 +581,17 @@ impl Executor {
             .unwrap_or((self.cfg.base_step, self.cfg.price_step))
     }
 
-    /// Keeps the open position's symbol streaming until it is flat.
+    /// Keeps the open position's symbol streaming until it is flat, and pushes
+    /// the new pinned set to the websocket task immediately.
     fn pin_board(&self, symbol: Option<String>) {
-        self.board_mut().pin(symbol);
+        let subscriptions = {
+            let mut board = self.board_mut();
+            board.pin(symbol);
+            board.subscriptions()
+        };
+        if let Some(tx) = &self.subscriptions_tx {
+            tx.send_replace(subscriptions);
+        }
     }
 
     /// Runs until a [`ExecutionCommand::Halt`] arrives or the command channel
@@ -1173,20 +1287,302 @@ impl Executor {
         self.publish_account();
     }
 
-    /// Reads the live USDT balance at boot so a missing balance is visible
-    /// before the first signal rather than after a rejected order.
+    /// Reads the live balances at boot, recovers any held coin into a managed
+    /// position and liquidates leftover balances, before the first signal.
     async fn live_preflight(&mut self) {
+        self.last_balance_poll = Instant::now();
+        let balances = match self.broker.balances().await {
+            Ok(balances) => balances,
+            Err(error) => {
+                eprintln!("[EXEC] could not load balances: {error}");
+                return;
+            }
+        };
+        let balance = self.remember_live_balance(&balances);
+        log_balance_audit(&balances);
+        println!("[EXEC] live balances: USDT={}", balance.available);
+        if balance.available < self.cfg.order_notional {
+            eprintln!(
+                "[EXEC] WARNING: USDT balance {} is below the {} order notional; entries will be capped to the balance",
+                balance.available, self.cfg.order_notional
+            );
+        }
+
+        self.recover_live_positions(&balances).await;
+    }
+
+    /// Mirrors the USDT row into the AI context. A missing row means zero.
+    fn remember_live_balance(&mut self, balances: &[Balance]) -> LiveBalance {
+        let balance = usdt_balance(balances).unwrap_or_default();
+        self.live_balance = Some(balance);
+        balance
+    }
+
+    /// Startup portfolio audit.
+    ///
+    /// The local portfolio is not persisted, so after a restart the venue is
+    /// the only source of truth. The largest non-USDT balance with a tradable
+    /// USDT market is adopted as the open position at the current mark, with
+    /// TP/SL armed around it. Every other balance is sold into USDT at market.
+    /// A balance without a USDT market cannot be priced or sold and is reported
+    /// and left untouched rather than guessed at.
+    async fn recover_live_positions(&mut self, balances: &[Balance]) {
+        if !self.portfolio.position.is_flat() {
+            println!(
+                "[EXEC] recovery skipped: the executor already tracks a {} position",
+                self.open_symbol.as_deref().unwrap_or("?").to_uppercase()
+            );
+            return;
+        }
+
+        let Some(scanner) = self.scanner.clone() else {
+            eprintln!(
+                "[EXEC] recovery unavailable: no scanner was wired into the executor; non-USDT balances stay untouched"
+            );
+            return;
+        };
+        let quotes = match scanner.quotes().await {
+            Ok(quotes) => quotes,
+            Err(error) => {
+                eprintln!(
+                    "[EXEC] recovery could not load spot quotes ({error}); non-USDT balances stay untouched"
+                );
+                return;
+            }
+        };
+
+        let holdings =
+            recovery_holdings(balances, &quotes, self.cfg.base_step, self.cfg.price_step);
+        if holdings.is_empty() {
+            println!("[EXEC] recovery: no non-USDT balances");
+            return;
+        }
+
+        for holding in &holdings {
+            match holding.mark {
+                Some(mark) => println!(
+                    "[EXEC] recovery: found {} qty={} free={} mark={} value={}USDT",
+                    holding.currency,
+                    holding.qty,
+                    holding.available,
+                    mark,
+                    holding.notional().round_dp(4)
+                ),
+                None => eprintln!(
+                    "[EXEC] recovery: {} qty={} has no USDT market; it cannot be priced or sold and is left untouched",
+                    holding.currency, holding.qty
+                ),
+            }
+        }
+
+        let mut primary = pick_primary_holding(&holdings);
+        if let Some(index) = primary {
+            if !self.adopt_recovered_position(&holdings[index]) {
+                eprintln!(
+                    "[EXEC] recovery: could not adopt {}; it will be liquidated instead",
+                    holdings[index].currency
+                );
+                primary = None;
+            }
+        } else {
+            eprintln!(
+                "[EXEC] recovery: no balance has a tradable USDT market to manage as a position"
+            );
+        }
+
+        for (index, holding) in holdings.iter().enumerate() {
+            if Some(index) == primary || holding.mark.is_none() {
+                continue;
+            }
+            self.liquidate_recovered_holding(holding).await;
+        }
+
+        let previous = self.live_balance;
         match self.sync_live_balance().await {
-            Ok(balance) => {
-                println!("[EXEC] live balances: USDT={}", balance.available);
-                if balance.available < self.cfg.order_notional {
+            Ok(balance) => log_live_balance(previous, balance),
+            Err(error) => eprintln!("[EXEC] balance refresh after recovery failed: {error}"),
+        }
+    }
+
+    /// Restores one recovered balance as the open long position.
+    ///
+    /// The entry basis is the mark at restart: the exchange balance does not
+    /// carry the original cost basis and the bot does not persist fills. TP/SL
+    /// are therefore anchored to the recovery price, which still guarantees the
+    /// position is protected from this point onward.
+    fn adopt_recovered_position(&mut self, holding: &RecoveredHolding) -> bool {
+        let Some(mark) = holding.mark else {
+            return false;
+        };
+        let rounded = round_to_step(holding.qty, holding.base_step, false);
+        let qty = if rounded > Decimal::ZERO {
+            rounded
+        } else {
+            holding.qty
+        };
+        if !self.portfolio.restore_long(qty, mark) {
+            return false;
+        }
+
+        let symbol = holding.symbol.clone();
+        self.open_symbol = Some(symbol.clone());
+        self.pin_board(Some(symbol.clone()));
+        self.board_mut()
+            .set_steps(&symbol, holding.base_step, holding.price_step);
+        self.last_mark = Some(mark);
+        self.opened_at = Some(Instant::now());
+        self.exit_retry_after = None;
+        self.open_fees = Decimal::ZERO;
+        self.working = None;
+
+        let take_profit = mark * (Decimal::ONE + self.cfg.take_profit_pct / Decimal::from(100));
+        let stop_loss = mark * (Decimal::ONE - self.cfg.stop_loss_pct / Decimal::from(100));
+        println!(
+            "[EXEC] recovered position: {} qty={} entry={} (restart mark) tp={} sl={}",
+            symbol.to_uppercase(),
+            qty,
+            mark.round_dp(8),
+            take_profit.round_dp(8),
+            stop_loss.round_dp(8)
+        );
+        if qty != holding.qty {
+            println!(
+                "[EXEC] recovered position rounded {} down to the venue step {}: unmanaged remainder {}",
+                holding.qty,
+                holding.base_step,
+                holding.qty - qty
+            );
+        }
+        if holding.qty > holding.available {
+            eprintln!(
+                "[EXEC] WARNING: {} of {} is frozen; exits may be rejected until the venue releases it",
+                holding.qty - holding.available,
+                symbol.to_uppercase()
+            );
+        }
+        true
+    }
+
+    /// Market-sells a non-primary balance back into USDT.
+    async fn liquidate_recovered_holding(&mut self, holding: &RecoveredHolding) {
+        if holding.available <= Decimal::ZERO {
+            eprintln!(
+                "[EXEC] recovery: {} has no free balance to sell (frozen {})",
+                holding.currency, holding.qty
+            );
+            return;
+        }
+        let amount = round_to_step(holding.available, holding.base_step, false);
+        if amount <= Decimal::ZERO {
+            eprintln!(
+                "[EXEC] recovery: {} balance {} is below the venue step {}; cannot sell it",
+                holding.currency, holding.available, holding.base_step
+            );
+            return;
+        }
+        let Some(mark) = holding.mark else {
+            return;
+        };
+        let Some(touch) = holding
+            .best_bid
+            .filter(|bid| *bid > Decimal::ZERO)
+            .or(holding.mark)
+        else {
+            return;
+        };
+        let limit = aggressive_limit(self.cfg.slippage_bps, Side::Sell, touch, holding.price_step);
+        if limit <= Decimal::ZERO {
+            eprintln!(
+                "[EXEC] recovery: no executable price for {}; cannot sell it",
+                holding.currency
+            );
+            return;
+        }
+
+        let snapshot = MarketSnapshot {
+            symbol: holding.symbol.clone(),
+            last_price: Some(mark),
+            best_bid: holding.best_bid,
+            best_ask: holding.best_ask,
+            window_low: None,
+            window_high: None,
+            move_pct: None,
+            anomaly: false,
+            updated_ns: 0,
+        };
+        let request = OrderRequest {
+            symbol: holding.symbol.clone(),
+            side: Side::Sell,
+            amount,
+            price: limit,
+            client_order_id: self.next_client_id(),
+        };
+        println!(
+            "[EXEC] recovery: liquidating {} qty={} at market (limit {})",
+            holding.symbol.to_uppercase(),
+            amount,
+            limit
+        );
+
+        let mut report = match self.broker.place(&request, &snapshot).await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!(
+                    "[EXEC] recovery: {} liquidation failed: {error}",
+                    holding.symbol.to_uppercase()
+                );
+                return;
+            }
+        };
+        println!(
+            "[EXEC] recovery order {} accepted: {}",
+            report.order_id,
+            report.status.as_str()
+        );
+
+        let deadline = Instant::now() + RECOVERY_FILL_TIMEOUT;
+        while !report.status.is_terminal() && Instant::now() < deadline {
+            tokio::time::sleep(RECOVERY_FILL_POLL).await;
+            match self.broker.status(&report).await {
+                Ok(updated) => report = updated,
+                Err(error) => {
                     eprintln!(
-                        "[EXEC] WARNING: USDT balance {} is below the {} order notional; entries will be capped to the balance",
-                        balance.available, self.cfg.order_notional
+                        "[EXEC] recovery: status for {} failed: {error}",
+                        holding.symbol.to_uppercase()
                     );
+                    break;
                 }
             }
-            Err(error) => eprintln!("[EXEC] could not load balances: {error}"),
+        }
+
+        if !report.status.is_terminal() {
+            match self.broker.cancel(&report).await {
+                Ok(()) => {}
+                Err(error) => eprintln!(
+                    "[EXEC] recovery: could not cancel {}: {error}",
+                    holding.symbol.to_uppercase()
+                ),
+            }
+            tokio::time::sleep(RECOVERY_FILL_POLL).await;
+            if let Ok(updated) = self.broker.status(&report).await {
+                report = updated;
+            }
+        }
+
+        if report.filled_amount > Decimal::ZERO {
+            println!(
+                "[EXEC] recovery: sold {} {} for {} USDT ({})",
+                report.filled_amount,
+                holding.symbol.to_uppercase(),
+                report.filled_cash.round_dp(4),
+                report.status.as_str()
+            );
+        } else {
+            eprintln!(
+                "[EXEC] recovery: {} liquidation ended {} with no fill; the balance remains",
+                holding.symbol.to_uppercase(),
+                report.status.as_str()
+            );
         }
     }
 
@@ -1196,9 +1592,7 @@ impl Executor {
         let balances = self.broker.balances().await?;
         // A missing USDT row means the account holds no USDT, not a protocol
         // failure; the AI should still see `0`, never a dash.
-        let balance = usdt_balance(&balances).unwrap_or_default();
-        self.live_balance = Some(balance);
-        Ok(balance)
+        Ok(self.remember_live_balance(&balances))
     }
 
     /// Periodic refresh: keeps `equity`/`cash` in the AI context current.
@@ -1324,6 +1718,26 @@ impl Executor {
             self.wins,
             if self.risk.is_halted() { "yes" } else { "no" },
         );
+    }
+}
+
+/// Logs every non-zero venue balance so a restart shows the full account, not
+/// only the USDT line.
+fn log_balance_audit(balances: &[Balance]) {
+    let mut any = false;
+    for balance in balances {
+        let total = balance.available + balance.frozen;
+        if total <= Decimal::ZERO {
+            continue;
+        }
+        any = true;
+        println!(
+            "[EXEC] balance audit: {} available={} frozen={} total={}",
+            balance.currency, balance.available, balance.frozen, total
+        );
+    }
+    if !any {
+        println!("[EXEC] balance audit: the venue account is empty");
     }
 }
 
@@ -1587,6 +2001,154 @@ mod tests {
             live_entry_notional(dec("5"), dec("100"), dec("0.002")),
             dec("5")
         );
+    }
+
+    fn spot_quote(
+        symbol: &str,
+        last: &str,
+        bid: &str,
+        ask: &str,
+        base_step: &str,
+        price_step: &str,
+    ) -> SpotQuote {
+        SpotQuote {
+            symbol: symbol.into(),
+            last: dec(last),
+            best_bid: Some(dec(bid)),
+            best_ask: Some(dec(ask)),
+            base_step: dec(base_step),
+            price_step: dec(price_step),
+        }
+    }
+
+    fn recovered_holding(
+        currency: &str,
+        qty: &str,
+        available: &str,
+        mark: &str,
+        base_step: &str,
+        price_step: &str,
+    ) -> RecoveredHolding {
+        RecoveredHolding {
+            currency: currency.into(),
+            symbol: format!("{}usdt", currency.to_ascii_lowercase()),
+            qty: dec(qty),
+            available: dec(available),
+            mark: Some(dec(mark)),
+            best_bid: Some(dec(mark)),
+            best_ask: Some(dec(mark)),
+            base_step: dec(base_step),
+            price_step: dec(price_step),
+        }
+    }
+
+    #[test]
+    fn recovery_adopts_the_largest_plain_coin_and_skips_usdt() {
+        let balances = vec![
+            Balance {
+                currency: "USDT".into(),
+                available: dec("2"),
+                frozen: Decimal::ZERO,
+            },
+            Balance {
+                currency: "USDC".into(),
+                available: dec("10"),
+                frozen: Decimal::ZERO,
+            },
+            Balance {
+                currency: "DNA".into(),
+                available: dec("50"),
+                frozen: Decimal::ZERO,
+            },
+        ];
+        let quotes = HashMap::from([
+            (
+                "usdcusdt".to_string(),
+                spot_quote("usdcusdt", "1", "0.9999", "1.0001", "0.01", "0.0001"),
+            ),
+            (
+                "dnausdt".to_string(),
+                spot_quote("dnausdt", "0.04", "0.0399", "0.0401", "1", "0.0001"),
+            ),
+        ]);
+
+        let holdings = recovery_holdings(&balances, &quotes, dec("0.000001"), dec("0.01"));
+        assert_eq!(holdings.len(), 2, "USDT itself is not a position");
+        assert!(holdings.iter().all(|holding| holding.currency != "USDT"));
+
+        let primary = pick_primary_holding(&holdings).expect("DNA is manageable");
+        assert_eq!(
+            holdings[primary].currency, "DNA",
+            "a stablecoin must never be adopted as the trading position"
+        );
+    }
+
+    #[test]
+    fn recovery_reports_an_unquoted_balance_but_does_not_adopt_it() {
+        let balances = vec![
+            Balance {
+                currency: "MYSTERY".into(),
+                available: dec("100"),
+                frozen: Decimal::ZERO,
+            },
+            Balance {
+                currency: "DNA".into(),
+                available: dec("50"),
+                frozen: Decimal::ZERO,
+            },
+        ];
+        let quotes = HashMap::from([(
+            "dnausdt".to_string(),
+            spot_quote("dnausdt", "0.04", "0.0399", "0.0401", "1", "0.0001"),
+        )]);
+
+        let holdings = recovery_holdings(&balances, &quotes, dec("0.000001"), dec("0.01"));
+        let mystery = holdings
+            .iter()
+            .find(|holding| holding.currency == "MYSTERY")
+            .expect("an unknown balance must still be reported");
+        assert!(mystery.mark.is_none());
+        assert_eq!(mystery.base_step, dec("0.000001"));
+
+        let primary = pick_primary_holding(&holdings).expect("DNA is manageable");
+        assert_eq!(holdings[primary].currency, "DNA");
+    }
+
+    #[tokio::test]
+    async fn recovered_position_is_closed_by_its_stop_loss() {
+        // The recovered pair is deliberately absent from the watchlist: the pin
+        // must add it to the websocket subscriptions and its steps to the board.
+        let board = board_with(&[]);
+        let mut executor = executor(config(), board.clone());
+        let (subscriptions_tx, subscriptions_rx) = watch::channel(Vec::new());
+        executor.subscriptions_tx = Some(subscriptions_tx);
+        let holding = recovered_holding("DNA", "50", "50", "0.04", "1", "0.0001");
+
+        assert!(executor.adopt_recovered_position(&holding));
+        assert_eq!(executor.portfolio.position.qty(), dec("50"));
+        assert_eq!(executor.portfolio.position.avg_entry(), dec("0.04"));
+        assert_eq!(executor.open_symbol.as_deref(), Some("dnausdt"));
+        assert!(executor.opened_at.is_some(), "the hold clock must start");
+        assert_eq!(
+            subscriptions_rx.borrow().as_slice(),
+            ["dnausdt".to_string()].as_slice(),
+            "recovery must subscribe the websocket to the held pair"
+        );
+        assert_eq!(
+            executor.steps_for("dnausdt"),
+            (dec("1"), dec("0.0001")),
+            "recovery must keep the venue steps for the pinned pair"
+        );
+
+        // 0.0397 is 0.75% below the recovery mark, past the 0.5% stop.
+        publish(&board, "dnausdt", "0.0397", "0.0398", "0.0397");
+        executor.maybe_exit().await;
+
+        assert!(
+            executor.portfolio.position.is_flat(),
+            "the recovered position must be sellable through the normal exit path"
+        );
+        assert_eq!(executor.open_symbol, None);
     }
 
     #[test]

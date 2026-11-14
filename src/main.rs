@@ -75,7 +75,7 @@ async fn main() {
         }
     };
     let scanner = match Scanner::new(scan_config.clone()) {
-        Ok(scanner) => scanner,
+        Ok(scanner) => Arc::new(scanner),
         Err(error) => {
             eprintln!("[BOOT] {error}");
             return;
@@ -176,6 +176,7 @@ async fn main() {
     } else {
         match Executor::new(config, mode, board.clone(), account_tx.clone()) {
             Ok(executor) => {
+                let executor = executor.with_balance_recovery(scanner.clone(), symbols_tx.clone());
                 executor_handle = Some(tokio::spawn(executor.run(exec_rx)));
             }
             Err(error) => {

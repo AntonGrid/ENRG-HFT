@@ -288,6 +288,13 @@ impl MarketBoard {
         self.meta.get(symbol).copied()
     }
 
+    /// Stores venue steps for a recovered position that is not on the scanner
+    /// watchlist. Call after [`MarketBoard::pin`] so the later `prune` keeps it.
+    pub fn set_steps(&mut self, symbol: &str, base_step: Decimal, price_step: Decimal) {
+        self.meta
+            .insert(symbol.to_string(), (base_step, price_step));
+    }
+
     pub fn is_active(&self, symbol: &str) -> bool {
         self.active.contains(symbol)
     }

@@ -121,6 +121,23 @@ impl Portfolio {
         }
     }
 
+    /// Restores a long position discovered on the venue at startup.
+    ///
+    /// Cash is intentionally untouched: in live mode the exchange balance is
+    /// authoritative and the local cash figure is not used for sizing. Realised
+    /// PnL starts at zero because the original fill history is not persisted.
+    pub fn restore_long(&mut self, qty: Decimal, avg_entry: Decimal) -> bool {
+        if qty <= Decimal::ZERO || avg_entry <= Decimal::ZERO {
+            return false;
+        }
+        self.position = Position {
+            qty,
+            avg_entry,
+            realized_pnl: Decimal::ZERO,
+        };
+        true
+    }
+
     /// Settles a fill against cash and the position; returns gross realised PnL.
     pub fn apply_fill(&mut self, side: Side, qty: Decimal, price: Decimal) -> Decimal {
         let cash_delta = qty * price;
@@ -244,5 +261,25 @@ mod tests {
         let portfolio = Portfolio::new(dec("100"));
         assert!(portfolio.can_afford(dec("99"), dec("1")));
         assert!(!portfolio.can_afford(dec("99"), dec("2")));
+    }
+
+    #[test]
+    fn restoring_a_long_leaves_cash_untouched() {
+        let mut portfolio = Portfolio::new(dec("2"));
+        assert!(portfolio.restore_long(dec("50"), dec("0.04")));
+
+        assert_eq!(portfolio.cash, dec("2"));
+        assert_eq!(portfolio.position.qty(), dec("50"));
+        assert_eq!(portfolio.position.avg_entry(), dec("0.04"));
+        assert_eq!(portfolio.position.realized_pnl(), Decimal::ZERO);
+        assert_eq!(portfolio.position.unrealized(dec("0.05")), dec("0.5"));
+    }
+
+    #[test]
+    fn restoring_a_long_rejects_empty_or_unpriced_positions() {
+        let mut portfolio = Portfolio::new(dec("2"));
+        assert!(!portfolio.restore_long(Decimal::ZERO, dec("1")));
+        assert!(!portfolio.restore_long(dec("1"), Decimal::ZERO));
+        assert!(portfolio.position.is_flat());
     }
 }

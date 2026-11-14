@@ -71,11 +71,19 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
   METHOD\nhost\npath\nsorted-params`), sends POST parameters as an
   `application/json` body (only auth fields are signed), prices limit orders
   through the touch with `EXEC_SLIPPAGE_BPS`, polls order state once a second,
-  cancels unfilled entries after `EXEC_ORDER_TTL_SECS`, and logs account
-  balances at boot. The live USDT balance is mirrored into the AI context
-  (`equity`/`cash`) every 30 seconds and right after each fill; an entry is
-  capped to the spendable balance so a small account is not rejected by the
+  cancels unfilled entries after `EXEC_ORDER_TTL_SECS`, and logs every non-zero
+  account balance at boot. The live USDT balance is mirrored into the AI
+  context (`equity`/`cash`) every 30 seconds and right after each fill; an entry
+  is capped to the spendable balance so a small account is not rejected by the
   venue.
+- **Startup recovery** audits the full balance list before the first signal.
+  The largest non-USDT coin with a tradable USDT market is restored as the open
+  position at the restart mark, pinned into the websocket feed and protected by
+  the normal TP/SL/timeout exits. Every other non-USDT balance (stablecoins,
+  leveraged tokens, unrelated coins) is sold into USDT with an aggressive
+  limit. A balance with no USDT market is logged and left untouched because it
+  cannot be priced or sold. The original cost basis is not persisted by HTX, so
+  a recovered position is anchored to the current mark.
 - **Ctrl-C** is a kill switch: the guard latches, working orders are cancelled,
   the position is flattened with one aggressive order and a final report is
   printed.
@@ -186,10 +194,11 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-109 unit tests, no network required: Decimal anomaly windows, scanner filtering
+115 unit tests, no network required: Decimal anomaly windows, scanner filtering
 and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
 normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
 request signing against an independent golden vector, order/balance parsers,
 portfolio PnL, every risk rejection, the paper broker's fill semantics and
-symbol isolation, sizing/rounding helpers and full paper round-trips through the
-multi-pair executor.
+symbol isolation, sizing/rounding helpers, startup balance recovery (primary
+selection, unquoted assets, stop-loss arming) and full paper round-trips through
+the multi-pair executor.

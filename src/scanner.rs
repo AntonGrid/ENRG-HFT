@@ -150,6 +150,38 @@ pub struct SymbolMeta {
     pub price_step: Decimal,
 }
 
+/// A price quote for one spot market, used by startup position recovery.
+///
+/// Unlike [`PairInfo`] this keeps stablecoin and leveraged-token markets too:
+/// the recovery audit has to be able to liquidate whatever the account holds,
+/// not only the pairs the scanner would choose for trading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotQuote {
+    pub symbol: String,
+    pub last: Decimal,
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+    pub base_step: Decimal,
+    pub price_step: Decimal,
+}
+
+impl SpotQuote {
+    /// The price used to value a balance and anchor a recovered stop.
+    pub fn mark(&self) -> Option<Decimal> {
+        if self.last > Decimal::ZERO {
+            return Some(self.last);
+        }
+        match (self.best_bid, self.best_ask) {
+            (Some(bid), Some(ask)) if bid > Decimal::ZERO && ask >= bid => {
+                Some((bid + ask) / Decimal::TWO)
+            }
+            (Some(bid), _) if bid > Decimal::ZERO => Some(bid),
+            (_, Some(ask)) if ask > Decimal::ZERO => Some(ask),
+            _ => None,
+        }
+    }
+}
+
 /// A raw ticker before filtering.
 #[derive(Debug, Clone)]
 struct Ticker {
@@ -186,18 +218,38 @@ impl Scanner {
     pub async fn scan(&self) -> Result<Vec<PairInfo>, ScannerError> {
         let tickers = self.fetch(TICKERS_PATH).await?;
         let tickers = parse_tickers(&tickers)?;
+        let metas = self.symbol_meta().await;
 
-        let metas = match self.fetch(SYMBOLS_PATH).await {
+        let mut pairs = rank_pairs(&tickers, &metas, &self.config);
+        append_pinned(&mut pairs, &tickers, &metas, &self.config);
+        Ok(pairs)
+    }
+
+    /// Every priced spot market, keyed by normalised symbol.
+    ///
+    /// This is deliberately broader than [`Scanner::scan`]: startup recovery
+    /// must be able to value and liquidate a balance even when that pair is not
+    /// volatile or liquid enough to make the trading watchlist.
+    pub async fn quotes(&self) -> Result<HashMap<String, SpotQuote>, ScannerError> {
+        let tickers = self.fetch(TICKERS_PATH).await?;
+        let tickers = parse_tickers(&tickers)?;
+        let metas = self.symbol_meta().await;
+
+        Ok(tickers
+            .iter()
+            .filter_map(|ticker| spot_quote(ticker, &metas, &self.config))
+            .map(|quote| (quote.symbol.clone(), quote))
+            .collect())
+    }
+
+    async fn symbol_meta(&self) -> HashMap<String, SymbolMeta> {
+        match self.fetch(SYMBOLS_PATH).await {
             Ok(value) => parse_symbol_meta(&value),
             Err(error) => {
                 eprintln!("[SCAN] symbol metadata unavailable ({error}); using fallback steps");
                 HashMap::new()
             }
-        };
-
-        let mut pairs = rank_pairs(&tickers, &metas, &self.config);
-        append_pinned(&mut pairs, &tickers, &metas, &self.config);
-        Ok(pairs)
+        }
     }
 
     async fn fetch(&self, path: &str) -> Result<Value, ScannerError> {
@@ -274,6 +326,29 @@ fn append_pinned(
     }
 }
 
+fn spot_quote(
+    ticker: &Ticker,
+    metas: &HashMap<String, SymbolMeta>,
+    config: &ScannerConfig,
+) -> Option<SpotQuote> {
+    if ticker.close <= Decimal::ZERO {
+        return None;
+    }
+    let (base_step, price_step) = metas
+        .get(&ticker.symbol)
+        .map(|meta| (meta.base_step, meta.price_step))
+        .unwrap_or((config.fallback_base_step, config.fallback_price_step));
+
+    Some(SpotQuote {
+        symbol: ticker.symbol.clone(),
+        last: ticker.close,
+        best_bid: ticker.bid,
+        best_ask: ticker.ask,
+        base_step,
+        price_step,
+    })
+}
+
 fn pair_from_ticker(
     ticker: &Ticker,
     metas: &HashMap<String, SymbolMeta>,
@@ -339,7 +414,7 @@ fn quoted_spread_bps(bid: Option<Decimal>, ask: Option<Decimal>) -> Option<Decim
 }
 
 /// `true` for a plain, non-stable, non-leveraged `<base>usdt` pair.
-fn is_tradable_usdt_symbol(symbol: &str) -> bool {
+pub(crate) fn is_tradable_usdt_symbol(symbol: &str) -> bool {
     let Some(base) = symbol.strip_suffix(QUOTE) else {
         return false;
     };
@@ -659,5 +734,27 @@ mod tests {
         assert_eq!(normalize_symbol(" LISTA-USDT "), Some("listausdt".into()));
         assert_eq!(normalize_symbol("bTcUsDt"), Some("btcusdt".into()));
         assert_eq!(normalize_symbol("..."), None);
+    }
+
+    #[test]
+    fn recovery_quote_prefers_the_last_trade_then_the_book() {
+        let mut quote = SpotQuote {
+            symbol: "dnausdt".into(),
+            last: dec("0.04"),
+            best_bid: Some(dec("0.0399")),
+            best_ask: Some(dec("0.0401")),
+            base_step: dec("1"),
+            price_step: dec("0.0001"),
+        };
+        assert_eq!(quote.mark(), Some(dec("0.04")));
+
+        quote.last = Decimal::ZERO;
+        assert_eq!(quote.mark(), Some(dec("0.04")), "mid of 0.0399/0.0401");
+
+        quote.best_ask = None;
+        assert_eq!(quote.mark(), Some(dec("0.0399")), "bid fallback");
+
+        quote.best_bid = None;
+        assert_eq!(quote.mark(), None, "no price means no mark");
     }
 }
