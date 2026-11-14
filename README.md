@@ -65,7 +65,9 @@ DeepSeek ──> Verdict(action, symbol) ──> AI gate (TRADE + fresh + symbol
   METHOD\nhost\npath\nsorted-params`), sends limit orders priced through the
   touch with `EXEC_SLIPPAGE_BPS`, polls order state once a second, cancels
   unfilled entries after `EXEC_ORDER_TTL_SECS`, and logs account balances at
-  boot.
+  boot. The live USDT balance is mirrored into the AI context (`equity`/`cash`)
+  every 30 seconds and right after each fill; an entry is capped to the
+  spendable balance so a small account is not rejected by the venue.
 - **Ctrl-C** is a kill switch: the guard latches, working orders are cancelled,
   the position is flattened with one aggressive order and a final report is
   printed.

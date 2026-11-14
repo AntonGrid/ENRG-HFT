@@ -26,7 +26,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::ai_brain::AiAction;
 use crate::execution::broker::Broker;
-use crate::execution::htx_rest::HtxRest;
+use crate::execution::htx_rest::{Balance, HtxRest};
 use crate::execution::portfolio::Portfolio;
 use crate::execution::risk::{Intent, RiskGuard, RiskLimits};
 use crate::execution::{ExecutionError, OrderReport, OrderRequest, OrderStatus, Side};
@@ -35,6 +35,8 @@ use crate::strategy::{MarketBoard, MarketSnapshot, Signal};
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// How often a live order is re-queried (HTX rate limits are per second).
 const LIVE_STATUS_POLL: Duration = Duration::from_secs(1);
+/// How often the live USDT balance is refreshed for the AI context.
+const LIVE_BALANCE_POLL: Duration = Duration::from_secs(30);
 /// Pause before re-attempting a failed or cancelled exit.
 const EXIT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -202,6 +204,44 @@ fn env_duration(name: &str, default_secs: u64) -> Result<Duration, ExecutionErro
         })
 }
 
+/// The USDT balance of the live venue account.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LiveBalance {
+    available: Decimal,
+    frozen: Decimal,
+}
+
+impl LiveBalance {
+    fn total(self) -> Decimal {
+        self.available + self.frozen
+    }
+}
+
+/// Extracts the USDT row from the venue balance list.
+fn usdt_balance(balances: &[Balance]) -> Option<LiveBalance> {
+    balances
+        .iter()
+        .find(|balance| balance.currency.eq_ignore_ascii_case("USDT"))
+        .map(|balance| LiveBalance {
+            available: balance.available,
+            frozen: balance.frozen,
+        })
+}
+
+/// Equity of the live account: USDT (free or frozen by an order) plus the
+/// marked open position. Cash alone understates equity while an entry order is
+/// resting, because the venue has moved part of the balance to `frozen`.
+fn live_equity(balance: LiveBalance, qty: Decimal, mark: Option<Decimal>) -> Decimal {
+    balance.total() + qty * mark.unwrap_or_default()
+}
+
+/// Caps the configured entry notional to what the live USDT balance can fund,
+/// fee included. With `available=10` and a 20 bps fee the cap is 9.98003992.
+fn live_entry_notional(configured: Decimal, available: Decimal, fee_rate: Decimal) -> Decimal {
+    let affordable = (available / (Decimal::ONE + fee_rate)).round_dp(8);
+    configured.min(affordable)
+}
+
 /// A read-only view of the account, shared with the AI layer.
 #[derive(Debug, Clone, Default)]
 pub struct AccountView {
@@ -319,6 +359,9 @@ pub struct Executor {
     exit_retry_after: Option<Instant>,
     last_mark: Option<Decimal>,
     last_status_poll: Instant,
+    /// Latest USDT balance of the live venue, mirrored into the AI context.
+    live_balance: Option<LiveBalance>,
+    last_balance_poll: Instant,
     halt_logged: bool,
     account_tx: watch::Sender<AccountView>,
 }
@@ -372,6 +415,8 @@ impl Executor {
             exit_retry_after: None,
             last_mark: None,
             last_status_poll: Instant::now(),
+            live_balance: None,
+            last_balance_poll: Instant::now(),
             halt_logged: false,
             account_tx,
         })
@@ -435,6 +480,7 @@ impl Executor {
                     }
                 }
                 _ = ticker.tick() => {
+                    self.refresh_live_balance().await;
                     self.on_tick().await;
                 }
             }
@@ -570,19 +616,22 @@ impl Executor {
         };
 
         let (base_step, price_step) = self.steps_for(&symbol);
-        let amount = size_order(self.cfg.order_notional, touch, base_step);
+        let limit = aggressive_limit(self.cfg.slippage_bps, signal.side, touch, price_step);
+        let target_notional = self.entry_notional(&symbol);
+        // Size against the limit, not the touch: the fee and the slippage
+        // cushion must fit the balance too.
+        let amount = size_order(target_notional, limit, base_step);
         if amount <= Decimal::ZERO {
             println!(
                 "[EXEC] skip {}: {} USDT buys less than one {}-step at {}",
                 symbol.to_uppercase(),
-                self.cfg.order_notional,
+                target_notional,
                 base_step,
-                touch
+                limit
             );
             return;
         }
 
-        let limit = aggressive_limit(self.cfg.slippage_bps, signal.side, touch, price_step);
         let request = OrderRequest {
             symbol: symbol.clone(),
             side: signal.side,
@@ -609,7 +658,12 @@ impl Executor {
         if let Some(cash) = cash {
             let notional = request.notional();
             let fee = notional * self.cfg.fee_rate();
-            if !self.portfolio.can_afford(notional, fee) {
+            let affordable = if self.broker.is_paper() {
+                self.portfolio.can_afford(notional, fee)
+            } else {
+                cash >= notional + fee
+            };
+            if !affordable {
                 println!(
                     "[EXEC] risk rejected {}: need {} + fee {}, have {}",
                     signal.side.as_str(),
@@ -700,6 +754,16 @@ impl Executor {
                         self.settle_trade(realized - fee);
                     }
                 }
+            }
+        }
+
+        if delta > Decimal::ZERO && !self.broker.is_paper() {
+            // The venue balance is authoritative right after a fill: keep the
+            // AI context in sync without waiting for the next 30s poll.
+            let previous = self.live_balance;
+            match self.sync_live_balance().await {
+                Ok(balance) => log_live_balance(previous, balance),
+                Err(error) => eprintln!("[EXEC] balance refresh after fill failed: {error}"),
             }
         }
 
@@ -1048,26 +1112,49 @@ impl Executor {
         self.publish_account();
     }
 
-    /// Logs the live account balances once at boot so a missing balance is
-    /// visible before the first signal rather than after a rejected order.
-    async fn live_preflight(&self) {
-        match self.broker.balances().await {
-            Ok(balances) => {
-                let quote = balances
-                    .iter()
-                    .find(|balance| balance.currency == "USDT")
-                    .map(|balance| balance.available)
-                    .unwrap_or(Decimal::ZERO);
-
-                println!("[EXEC] live balances: USDT={quote}");
-                if quote < self.cfg.order_notional {
+    /// Reads the live USDT balance at boot so a missing balance is visible
+    /// before the first signal rather than after a rejected order.
+    async fn live_preflight(&mut self) {
+        match self.sync_live_balance().await {
+            Ok(balance) => {
+                println!("[EXEC] live balances: USDT={}", balance.available);
+                if balance.available < self.cfg.order_notional {
                     eprintln!(
-                        "[EXEC] WARNING: USDT balance {quote} is below the {} order notional",
-                        self.cfg.order_notional
+                        "[EXEC] WARNING: USDT balance {} is below the {} order notional; entries will be capped to the balance",
+                        balance.available, self.cfg.order_notional
                     );
                 }
             }
             Err(error) => eprintln!("[EXEC] could not load balances: {error}"),
+        }
+    }
+
+    /// Fetches the live USDT balance and caches it for the AI context.
+    async fn sync_live_balance(&mut self) -> Result<LiveBalance, ExecutionError> {
+        self.last_balance_poll = Instant::now();
+        let balances = self.broker.balances().await?;
+        // A missing USDT row means the account holds no USDT, not a protocol
+        // failure; the AI should still see `0`, never a dash.
+        let balance = usdt_balance(&balances).unwrap_or_default();
+        self.live_balance = Some(balance);
+        Ok(balance)
+    }
+
+    /// Periodic refresh: keeps `equity`/`cash` in the AI context current.
+    /// Skipped while a position or order is live so the REST call can never
+    /// delay a take-profit/stop-loss decision; the fill path refreshes instead.
+    async fn refresh_live_balance(&mut self) {
+        if self.broker.is_paper()
+            || self.working.is_some()
+            || !self.portfolio.position.is_flat()
+            || self.last_balance_poll.elapsed() < LIVE_BALANCE_POLL
+        {
+            return;
+        }
+        let previous = self.live_balance;
+        match self.sync_live_balance().await {
+            Ok(balance) => log_live_balance(previous, balance),
+            Err(error) => eprintln!("[EXEC] balance refresh failed: {error}"),
         }
     }
 
@@ -1079,22 +1166,61 @@ impl Executor {
         format!("enrg-{nanos:x}")
     }
 
-    /// Cash is only known locally in paper mode.
+    /// Free quote currency: tracked locally in paper, fetched from HTX live.
     fn available_cash(&self) -> Option<Decimal> {
-        self.broker.is_paper().then_some(self.portfolio.cash)
+        if self.broker.is_paper() {
+            Some(self.portfolio.cash)
+        } else {
+            self.live_balance.map(|balance| balance.available)
+        }
+    }
+
+    /// Notional for the next entry. Live orders are additionally capped by the
+    /// spendable USDT balance, so a small account is not rejected by the venue
+    /// (or by the risk guard) for an order it cannot fund.
+    fn entry_notional(&self, symbol: &str) -> Decimal {
+        let configured = self.cfg.order_notional;
+        if self.broker.is_paper() {
+            return configured;
+        }
+        let Some(balance) = self.live_balance else {
+            return configured;
+        };
+        let target = live_entry_notional(configured, balance.available, self.cfg.fee_rate());
+        if target < configured {
+            println!(
+                "[EXEC] sizing {}: live balance {} USDT caps the order at {} USDT (configured {})",
+                symbol.to_uppercase(),
+                balance.available,
+                target,
+                configured
+            );
+        }
+        target
+    }
+
+    /// Cash reported to the AI: frozen funds are still ours, so include them.
+    fn account_cash(&self) -> Option<Decimal> {
+        if self.broker.is_paper() {
+            Some(self.portfolio.cash)
+        } else {
+            self.live_balance.map(LiveBalance::total)
+        }
     }
 
     fn publish_account(&self) {
         let mark = self.last_mark;
+        let qty = self.portfolio.position.qty();
         let view = AccountView {
             equity: if self.broker.is_paper() {
                 Some(self.portfolio.equity(mark.unwrap_or_default()))
             } else {
-                None
+                self.live_balance
+                    .map(|balance| live_equity(balance, qty, mark))
             },
-            cash: self.available_cash(),
+            cash: self.account_cash(),
             position_symbol: self.open_symbol.clone(),
-            position_qty: self.portfolio.position.qty(),
+            position_qty: qty,
             avg_entry: self.portfolio.position.avg_entry(),
             unrealized: mark.map(|mark| self.portfolio.position.unrealized(mark)),
             realized_today: self.risk.realized_today(),
@@ -1112,13 +1238,19 @@ impl Executor {
                 .round_dp(4)
                 .to_string()
         } else {
-            "-".to_string()
+            self.live_balance
+                .map(|balance| {
+                    live_equity(balance, self.portfolio.position.qty(), self.last_mark)
+                        .round_dp(4)
+                        .to_string()
+                })
+                .unwrap_or_else(|| "-".to_string())
         };
         println!(
             "[EXEC] {label}: mode={} equity={} cash={} position={} symbol={} avg_entry={} realized_today={} realized_total={} trades={} wins={} halted={}",
             self.broker.name(),
             equity,
-            option_text(self.available_cash()),
+            option_text(self.account_cash()),
             self.portfolio.position.qty(),
             self.open_symbol
                 .as_deref()
@@ -1132,6 +1264,19 @@ impl Executor {
             if self.risk.is_halted() { "yes" } else { "no" },
         );
     }
+}
+
+/// Logs a live balance only when it actually moved.
+fn log_live_balance(previous: Option<LiveBalance>, balance: LiveBalance) {
+    if previous == Some(balance) {
+        return;
+    }
+    println!(
+        "[EXEC] live balance: USDT available={} frozen={} total={}",
+        balance.available,
+        balance.frozen,
+        balance.total()
+    );
 }
 
 /// The price an entry would touch: buys lift the ask, sells hit the bid.
@@ -1341,6 +1486,86 @@ mod tests {
         assert_eq!(
             size_order(dec("1"), dec("65001"), dec("0.001")),
             Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn live_usdt_balance_is_extracted_and_priced_into_equity() {
+        let balances = vec![
+            Balance {
+                currency: "BTC".into(),
+                available: dec("1"),
+                frozen: Decimal::ZERO,
+            },
+            Balance {
+                currency: "usdt".into(),
+                available: dec("10.002001"),
+                frozen: dec("0.5"),
+            },
+        ];
+        let balance = usdt_balance(&balances).expect("USDT must be found");
+        assert_eq!(balance.available, dec("10.002001"));
+        assert_eq!(balance.total(), dec("10.502001"));
+        assert_eq!(live_equity(balance, Decimal::ZERO, None), dec("10.502001"));
+        assert_eq!(
+            live_equity(balance, dec("2"), Some(dec("3"))),
+            dec("16.502001"),
+            "an open position must be marked into equity"
+        );
+    }
+
+    #[test]
+    fn live_entries_are_capped_by_the_balance_and_fee() {
+        // 10 / 1.002 = 9.98003992..., so the order fits the 10 USDT balance.
+        assert_eq!(
+            live_entry_notional(dec("25"), dec("10"), dec("0.002")),
+            dec("9.98003992")
+        );
+        // A funded account keeps the configured notional.
+        assert_eq!(
+            live_entry_notional(dec("5"), dec("100"), dec("0.002")),
+            dec("5")
+        );
+    }
+
+    #[test]
+    fn account_view_describes_live_equity_and_cash() {
+        let view = AccountView {
+            equity: Some(dec("9.98")),
+            cash: Some(dec("10.002")),
+            ..AccountView::default()
+        };
+        let text = view.describe();
+        assert!(
+            text.contains("equity=9.98 cash=10.002"),
+            "the AI context must show live numbers, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn live_balance_populates_the_ai_account_view() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        let rest = HtxRest::new("https://api.htx.com", "test-key", "test-secret")
+            .expect("test rest client must build");
+        let (tx, rx) = watch::channel(AccountView::default());
+        let mut executor = Executor::new(config(), ExecutionMode::Paper, board, tx)
+            .expect("paper executor must build");
+        // Swap the paper venue for a live one without touching the network.
+        executor.broker = Broker::live(rest);
+
+        executor.live_balance = Some(LiveBalance {
+            available: dec("10.002001"),
+            frozen: Decimal::ZERO,
+        });
+        executor.publish_account();
+
+        let view = rx.borrow().clone();
+        assert_eq!(view.cash, Some(dec("10.002001")));
+        assert_eq!(view.equity, Some(dec("10.002001")));
+        assert!(
+            view.describe().contains("equity=10.0020 cash=10.0020"),
+            "the AI must see the live balance, got {:?}",
+            view.describe()
         );
     }
 
