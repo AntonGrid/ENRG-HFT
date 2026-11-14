@@ -45,6 +45,10 @@ const EXIT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RECOVERY_FILL_POLL: Duration = Duration::from_millis(500);
 /// How long startup recovery waits for a liquidation order before cancelling.
 const RECOVERY_FILL_TIMEOUT: Duration = Duration::from_secs(15);
+/// HTX rejects spot orders below 1 USDT with `order-value-min-error`.
+const HTX_MIN_ORDER_VALUE_USDT: Decimal = Decimal::ONE;
+/// The venue error code returned when an order is below that minimum.
+const ORDER_VALUE_MIN_ERROR: &str = "order-value-min-error";
 
 /// What the process is allowed to do with money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +252,18 @@ fn live_entry_notional(configured: Decimal, available: Decimal, fee_rate: Decima
     configured.min(affordable)
 }
 
+/// `true` when HTX refused an order because its value is below the venue
+/// minimum. Retrying such an order can never succeed: the balance is dust.
+fn is_order_value_min_error(error: &ExecutionError) -> bool {
+    match error {
+        ExecutionError::Api { code, message } => {
+            code.eq_ignore_ascii_case(ORDER_VALUE_MIN_ERROR)
+                || message.to_ascii_lowercase().contains(ORDER_VALUE_MIN_ERROR)
+        }
+        _ => false,
+    }
+}
+
 /// One non-USDT balance found on the venue at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveredHolding {
@@ -266,6 +282,14 @@ impl RecoveredHolding {
     fn notional(&self) -> Decimal {
         self.mark.unwrap_or_default() * self.qty
     }
+}
+
+/// A balance whose whole value is below the venue's minimum order. It cannot
+/// be sold and must never be adopted as a position or retried as an exit.
+fn is_dust_holding(holding: &RecoveredHolding) -> bool {
+    holding
+        .mark
+        .is_some_and(|_| holding.notional() < HTX_MIN_ORDER_VALUE_USDT)
 }
 
 /// Turns venue balances into recovery candidates.
@@ -1095,6 +1119,23 @@ impl Executor {
         self.publish_account();
     }
 
+    /// Forgets a residual position the venue refuses to trade.
+    ///
+    /// The local book becomes flat so `maybe_exit` stops re-placing an order
+    /// that can never succeed. No fill happened, so cash, fee and trade counters
+    /// are intentionally left untouched.
+    fn drop_tracked_position(&mut self) {
+        self.portfolio.forget_position();
+        self.working = None;
+        self.open_symbol = None;
+        self.opened_at = None;
+        self.exit_retry_after = None;
+        self.open_fees = Decimal::ZERO;
+        self.last_mark = None;
+        self.pin_board(None);
+        self.publish_account();
+    }
+
     /// Closes the position on take-profit, stop-loss or timeout, using the book
     /// of the symbol that is actually held.
     async fn maybe_exit(&mut self) {
@@ -1200,6 +1241,13 @@ impl Executor {
                 self.absorb_working().await;
             }
             Err(error) => {
+                if is_order_value_min_error(&error) {
+                    eprintln!(
+                        "[EXEC] exit rejected as below the venue minimum: {error}; dropping the position so it is not retried"
+                    );
+                    self.drop_tracked_position();
+                    return;
+                }
                 self.exit_retry_after = Some(now + EXIT_RETRY_DELAY);
                 eprintln!("[EXEC] exit placement failed: {error}");
             }
@@ -1324,8 +1372,9 @@ impl Executor {
     /// the only source of truth. The largest non-USDT balance with a tradable
     /// USDT market is adopted as the open position at the current mark, with
     /// TP/SL armed around it. Every other balance is sold into USDT at market.
-    /// A balance without a USDT market cannot be priced or sold and is reported
-    /// and left untouched rather than guessed at.
+    /// A balance worth less than the venue minimum order is logged as dust and
+    /// skipped: it cannot be sold. A balance without a USDT market cannot be
+    /// priced or sold and is reported and left untouched rather than guessed at.
     async fn recover_live_positions(&mut self, balances: &[Balance]) {
         if !self.portfolio.position.is_flat() {
             println!(
@@ -1351,14 +1400,23 @@ impl Executor {
             }
         };
 
-        let holdings =
-            recovery_holdings(balances, &quotes, self.cfg.base_step, self.cfg.price_step);
-        if holdings.is_empty() {
+        let found = recovery_holdings(balances, &quotes, self.cfg.base_step, self.cfg.price_step);
+        if found.is_empty() {
             println!("[EXEC] recovery: no non-USDT balances");
             return;
         }
 
-        for holding in &holdings {
+        let mut holdings = Vec::with_capacity(found.len());
+        for holding in found {
+            if is_dust_holding(&holding) {
+                println!(
+                    "[EXEC] ignoring dust: {} qty={} value={}",
+                    holding.currency,
+                    holding.qty,
+                    holding.notional().round_dp(8)
+                );
+                continue;
+            }
             match holding.mark {
                 Some(mark) => println!(
                     "[EXEC] recovery: found {} qty={} free={} mark={} value={}USDT",
@@ -1373,6 +1431,10 @@ impl Executor {
                     holding.currency, holding.qty
                 ),
             }
+            holdings.push(holding);
+        }
+        if holdings.is_empty() {
+            println!("[EXEC] recovery: nothing tradable left after dust filtering");
         }
 
         let mut primary = pick_primary_holding(&holdings);
@@ -1384,7 +1446,7 @@ impl Executor {
                 );
                 primary = None;
             }
-        } else {
+        } else if !holdings.is_empty() {
             eprintln!(
                 "[EXEC] recovery: no balance has a tradable USDT market to manage as a position"
             );
@@ -2003,6 +2065,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_ignores_balances_below_the_venue_minimum() {
+        // The exact residual from the bug report: 0.0000976 DNA at 0.04.
+        let dust = recovered_holding("DNA", "0.0000976", "0.0000976", "0.04", "1", "0.0001");
+        assert_eq!(dust.notional(), dec("0.000003904"));
+        assert!(
+            is_dust_holding(&dust),
+            "a balance worth less than 1 USDT can never be sold"
+        );
+
+        // 24 DNA at 0.04 = 0.96 USDT is still below the venue minimum.
+        let just_under = recovered_holding("DNA", "24", "24", "0.04", "1", "0.0001");
+        assert!(is_dust_holding(&just_under));
+
+        // Exactly 1 USDT is the minimum accepted order, not dust.
+        let minimum = recovered_holding("DNA", "25", "25", "0.04", "1", "0.0001");
+        assert!(!is_dust_holding(&minimum));
+
+        // An unquoted balance has no value; it is reported separately.
+        let unquoted = RecoveredHolding {
+            mark: None,
+            ..minimum
+        };
+        assert!(!is_dust_holding(&unquoted));
+    }
+
+    #[test]
+    fn order_value_min_error_is_recognized() {
+        let api = |code: &str, message: &str| ExecutionError::Api {
+            code: code.into(),
+            message: message.into(),
+        };
+
+        assert!(is_order_value_min_error(&api(
+            "order-value-min-error",
+            "order value cannot be less than 1 USDT"
+        )));
+        assert!(is_order_value_min_error(&api(
+            "invalid-argument",
+            "ORDER-VALUE-MIN-ERROR"
+        )));
+        assert!(!is_order_value_min_error(&api(
+            "invalid-argument",
+            "invalid symbol"
+        )));
+        assert!(!is_order_value_min_error(&ExecutionError::Http(
+            "timeout".into()
+        )));
+    }
+
     fn spot_quote(
         symbol: &str,
         last: &str,
@@ -2149,6 +2261,32 @@ mod tests {
             "the recovered position must be sellable through the normal exit path"
         );
         assert_eq!(executor.open_symbol, None);
+    }
+
+    #[test]
+    fn dropping_a_residual_position_resets_the_executor() {
+        let board = board_with(&[]);
+        let mut executor = executor(config(), board);
+        let (subscriptions_tx, subscriptions_rx) = watch::channel(Vec::new());
+        executor.subscriptions_tx = Some(subscriptions_tx);
+        let holding = recovered_holding("DNA", "0.0000976", "0.0000976", "0.04", "1", "0.0001");
+
+        assert!(executor.adopt_recovered_position(&holding));
+        executor.open_fees = dec("0.01");
+        let cash = executor.portfolio.cash;
+
+        executor.drop_tracked_position();
+
+        assert!(executor.portfolio.position.is_flat());
+        assert_eq!(executor.portfolio.cash, cash, "no fill means no cash move");
+        assert_eq!(executor.open_symbol, None);
+        assert_eq!(executor.opened_at, None);
+        assert_eq!(executor.open_fees, Decimal::ZERO);
+        assert_eq!(executor.exit_retry_after, None);
+        assert!(
+            subscriptions_rx.borrow().is_empty(),
+            "a dropped position must leave the websocket watchlist"
+        );
     }
 
     #[test]

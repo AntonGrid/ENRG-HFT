@@ -138,6 +138,14 @@ impl Portfolio {
         true
     }
 
+    /// Drops the locally tracked position without booking cash or PnL.
+    ///
+    /// Used when the venue rejects a residual as untradable dust: no fill
+    /// happened, so cash, fees and realised PnL must stay exactly as they were.
+    pub fn forget_position(&mut self) {
+        self.position = Position::default();
+    }
+
     /// Settles a fill against cash and the position; returns gross realised PnL.
     pub fn apply_fill(&mut self, side: Side, qty: Decimal, price: Decimal) -> Decimal {
         let cash_delta = qty * price;
@@ -281,5 +289,20 @@ mod tests {
         assert!(!portfolio.restore_long(Decimal::ZERO, dec("1")));
         assert!(!portfolio.restore_long(dec("1"), Decimal::ZERO));
         assert!(portfolio.position.is_flat());
+    }
+
+    #[test]
+    fn forgetting_a_position_keeps_cash_and_fees() {
+        let mut portfolio = Portfolio::new(dec("2"));
+        assert!(portfolio.restore_long(dec("50"), dec("0.04")));
+        portfolio.charge_fee(dec("0.5"));
+
+        portfolio.forget_position();
+
+        assert!(portfolio.position.is_flat());
+        assert_eq!(portfolio.position.avg_entry(), Decimal::ZERO);
+        assert_eq!(portfolio.position.realized_pnl(), Decimal::ZERO);
+        assert_eq!(portfolio.cash, dec("1.5"));
+        assert_eq!(portfolio.fees_paid, dec("0.5"));
     }
 }

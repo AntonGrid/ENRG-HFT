@@ -81,9 +81,11 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
   position at the restart mark, pinned into the websocket feed and protected by
   the normal TP/SL/timeout exits. Every other non-USDT balance (stablecoins,
   leveraged tokens, unrelated coins) is sold into USDT with an aggressive
-  limit. A balance with no USDT market is logged and left untouched because it
-  cannot be priced or sold. The original cost basis is not persisted by HTX, so
-  a recovered position is anchored to the current mark.
+  limit. Balances worth less than HTX's 1 USDT minimum order are logged as
+  `ignoring dust` and left untouched: they can never be sold. A balance with no
+  USDT market is logged and left untouched because it cannot be priced or sold.
+  The original cost basis is not persisted by HTX, so a recovered position is
+  anchored to the current mark.
 - **Ctrl-C** is a kill switch: the guard latches, working orders are cancelled,
   the position is flattened with one aggressive order and a final report is
   printed.
@@ -184,6 +186,9 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
   limit actually crosses the touch.
 - A missing or failing DeepSeek key leaves the gate closed: no entries, but the
   market feed, risk guard and positions remain live.
+- An exit rejected with HTX `order-value-min-error` is logged once and the
+  residual is dropped from local state, so the bot never spams the venue with an
+  order that can never be filled.
 - The executor never blocks the socket: it reads only the books of its own
   working order / open position from the shared board and trades from its own
   task.
@@ -194,11 +199,12 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-115 unit tests, no network required: Decimal anomaly windows, scanner filtering
+119 unit tests, no network required: Decimal anomaly windows, scanner filtering
 and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
 normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
 request signing against an independent golden vector, order/balance parsers,
 portfolio PnL, every risk rejection, the paper broker's fill semantics and
 symbol isolation, sizing/rounding helpers, startup balance recovery (primary
-selection, unquoted assets, stop-loss arming) and full paper round-trips through
-the multi-pair executor.
+selection, dust filtering, unquoted assets, stop-loss arming) and full paper
+round-trips through the multi-pair executor. The exit path is also covered for
+the venue-minimum error that drops an unsellable residual instead of retrying.
