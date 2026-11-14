@@ -8,14 +8,16 @@ Hybrid **multi-pair** scalping bot — six layers, one binary.
 | 1. Fast hands | `src/exchange/htx.rs` | One HTX WebSocket (`wss://api.htx.com/ws`, fallback `wss://api.huobi.pro/ws`) for **all** scanned pairs: IPv4-only dial, gzip decoding, heartbeat, live `sub`/`unsub` as the watchlist rotates, per-symbol throttled logs, 15s stall watchdog and automatic reconnect. |
 | 2. Mathematics | `src/quant_core.rs` | Exact `Decimal` anomaly detection: more than 1% price move inside the last 10 ticks. |
 | 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, directional `Signal { symbol, side, price, … }`, and the multi-pair context read by DeepSeek and the executor. |
-| 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager with a strict `{"action":"TRADE"\|"PAUSE","symbol":"…","reason":"…"}` contract, polled every `AI_INTERVAL_SECS`. |
-| 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders **on the pair the AI selected**. |
+| 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager with a strict `{"action":"TRADE"\|"PAUSE","symbols":["…"],"reason":"…"}` contract, polled every `AI_INTERVAL_SECS`. |
+| 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders **on any pair the AI cleared**. |
 
 The AI is a **gate and a pair selector**, not a signal: a `TRADE` verdict opens
-the gate for exactly one symbol for `EXEC_GATE_TTL_SECS`; the quant signal on
-that symbol decides *when* and in which direction (momentum across the anomaly
-window). A stale verdict, a `PAUSE`, a symbol outside the scanner watchlist or a
-missing DeepSeek key keeps entries disabled while the bot keeps streaming data.
+the gate for every symbol in its list for `EXEC_GATE_TTL_SECS`; the quant signal
+on any of those symbols decides *when* and in which direction (momentum across
+the anomaly window). A stale verdict, a `PAUSE`, a symbol outside the scanner
+watchlist or a missing DeepSeek key keeps entries disabled while the bot keeps
+streaming data. Pair names are normalised (`LISTA-USDT` → `listausdt`); a bare
+base ticker such as `XMR` is accepted only when `XMRUSDT` is on the watchlist.
 
 ## Market scanner
 
@@ -49,7 +51,7 @@ REST tickers ──> Scanner ──> watchlist ──> per-symbol WS subscriptio
                                               │
 WS tick ──> MarketBoard book ──> Signal(symbol) ─┐
                                                  v
-DeepSeek ──> Verdict(action, symbol) ──> AI gate (TRADE + fresh + symbol matches?)
+DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbol in list?)
                                                  v
                                        RiskGuard (size, notional, cooldown, daily loss)
                                                  v
@@ -146,8 +148,8 @@ watchlist:
 1. LISTAUSDT last=0.1302 bid=0.1301 ask=0.1302 spread=7.7bps chg24=30% amp24=40% vol24=4200000 anomaly=yes
 ...
 account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
-[AI] 2026-11-14 16:27:02 UTC decision: TRADE LISTAUSDT — momentum and acceptable spread
-[EXEC] AI gate TRADE LISTAUSDT — momentum and acceptable spread
+[AI] 2026-11-14 16:27:02 UTC decision: TRADE [LISTAUSDT, FUNUSDT, TRUMPUSDT] — momentum across the watchlist
+[EXEC] AI gate TRADE 3 pairs: LISTAUSDT, FUNUSDT, TRUMPUSDT — momentum across the watchlist
 [SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) — >1% range in the last 10 ticks
 [EXEC] placing BUY 191.7 LISTAUSDT @ 0.1305 (signal: >1% range in the last 10 ticks)
 [EXEC] order paper-1 accepted: filled
@@ -178,9 +180,9 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-96 unit tests, no network required: Decimal anomaly windows, scanner filtering
+106 unit tests, no network required: Decimal anomaly windows, scanner filtering
 and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
-normalisation with symbol selection, HTX frame parsing/gzip/channel routing,
+normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
 request signing against an independent golden vector, order/balance parsers,
 portfolio PnL, every risk rejection, the paper broker's fill semantics and
 symbol isolation, sizing/rounding helpers and full paper round-trips through the

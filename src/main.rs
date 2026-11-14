@@ -8,10 +8,10 @@
 //!    over a single WebSocket, adding and removing subscriptions live;
 //! 3. `strategy` keeps an isolated book per symbol and emits a `Signal` tagged
 //!    with the pair that produced it;
-//! 4. `ai_brain` asks DeepSeek, once a minute, which pair to trade (or PAUSE);
-//! 5. `execution::engine` turns a fresh per-symbol `TRADE` verdict plus a signal
-//!    into an order on that exact pair, manages the position and flattens on
-//!    Ctrl-C.
+//! 4. `ai_brain` asks DeepSeek, once a minute, which pairs to trade (or PAUSE);
+//! 5. `execution::engine` turns a fresh `TRADE` verdict covering many pairs plus
+//!    a per-symbol signal into an order on the pair that dislocated, manages the
+//!    position and flattens on Ctrl-C.
 //!
 //! Execution defaults to *paper*: real orders require `EXECUTION_MODE=live` and
 //! HTX credentials. There is no default trading pair — the scanner decides.
@@ -266,20 +266,25 @@ async fn main() {
             println!("[AI] {stamp} asking DeepSeek about {pair_count} pairs:\n{context}");
             match ai_brain::ask_deepseek(&context).await {
                 Ok(decision) => {
-                    let symbol = decision
-                        .symbol
-                        .as_deref()
-                        .map(|symbol| format!(" {}", symbol.to_uppercase()))
-                        .unwrap_or_default();
+                    let pairs: Vec<String> = decision
+                        .symbols
+                        .iter()
+                        .map(|symbol| symbol.to_uppercase())
+                        .collect();
+                    let pairs_text = if pairs.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", pairs.join(", "))
+                    };
                     println!(
-                        "[AI] {stamp} decision: {}{symbol} — {}",
+                        "[AI] {stamp} decision: {}{pairs_text} — {}",
                         decision.action.as_str(),
                         decision.reason
                     );
                     if ai_commands
                         .send(ExecutionCommand::Verdict {
                             action: decision.action,
-                            symbol: decision.symbol,
+                            symbols: decision.symbols,
                             reason: decision.reason,
                         })
                         .await

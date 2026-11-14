@@ -15,6 +15,7 @@
 //! [`MarketSnapshot`] for the symbol it is about to trade (or is holding) from
 //! the shared [`MarketBoard`] and only speaks to the exchange from its own task.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -287,21 +288,21 @@ fn option_text(value: Option<Decimal>) -> String {
 pub enum ExecutionCommand {
     /// A market dislocation from the strategy, already tagged with its symbol.
     Signal(Signal),
-    /// A fresh risk verdict from the AI layer, naming the pair to trade.
+    /// A fresh risk verdict from the AI layer, naming every pair it cleared.
     Verdict {
         action: AiAction,
-        symbol: Option<String>,
+        symbols: Vec<String>,
         reason: String,
     },
     /// Operator kill switch (Ctrl-C, fatal error elsewhere).
     Halt(String),
 }
 
-/// The AI gate: entries require a fresh `TRADE` verdict for that exact symbol.
+/// The AI gate: entries require a fresh `TRADE` verdict covering that symbol.
 #[derive(Debug, Clone)]
 struct Gate {
     action: AiAction,
-    symbol: Option<String>,
+    symbols: Vec<String>,
     reason: String,
     at: Option<Instant>,
 }
@@ -310,7 +311,7 @@ impl Gate {
     fn closed() -> Self {
         Self {
             action: AiAction::Pause,
-            symbol: None,
+            symbols: Vec::new(),
             reason: "no AI verdict yet".into(),
             at: None,
         }
@@ -318,8 +319,38 @@ impl Gate {
 
     fn permits(&self, symbol: &str, ttl: Duration, now: Instant) -> bool {
         self.action == AiAction::Trade
-            && self.symbol.as_deref() == Some(symbol)
+            && self.symbols.iter().any(|candidate| candidate == symbol)
             && self.at.is_some_and(|at| now.duration_since(at) <= ttl)
+    }
+}
+
+/// Renders the cleared pairs for the gate log, e.g. `3 pairs: A, B, C`.
+fn format_gate_symbols(symbols: &[String]) -> String {
+    if symbols.is_empty() {
+        return "no watchlist pairs".to_string();
+    }
+    let names = symbols
+        .iter()
+        .map(|symbol| symbol.to_uppercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if symbols.len() == 1 { "pair" } else { "pairs" };
+    format!("{} {noun}: {names}", symbols.len())
+}
+
+/// Resolves a normalised model symbol to the watchlist. Models occasionally
+/// drop the quote suffix (`XMR` instead of `XMRUSDT`); accepting that shorthand
+/// only when the full pair is actually streamed keeps the gate useful without
+/// letting a hallucinated market through.
+fn resolve_watchlist_symbol(board: &MarketBoard, candidate: &str) -> Option<String> {
+    if board.is_active(candidate) {
+        return Some(candidate.to_string());
+    }
+    let with_quote = format!("{candidate}usdt");
+    if board.is_active(&with_quote) {
+        Some(with_quote)
+    } else {
+        None
     }
 }
 
@@ -498,39 +529,59 @@ impl Executor {
             }
             ExecutionCommand::Verdict {
                 action,
-                symbol,
+                symbols,
                 reason,
             } => {
-                let symbol = symbol.and_then(|symbol| crate::scanner::normalize_symbol(&symbol));
-                let valid_symbol = match action {
-                    AiAction::Trade => match &symbol {
-                        Some(candidate) if self.board().is_active(candidate) => {
-                            Some(candidate.clone())
-                        }
-                        Some(candidate) => {
-                            println!(
-                                "[EXEC] AI picked {}, which is not on the scanner watchlist; gate stays closed",
-                                candidate.to_uppercase()
-                            );
-                            None
-                        }
-                        None => {
-                            println!("[EXEC] AI sent TRADE without a symbol; gate stays closed");
-                            None
-                        }
-                    },
-                    AiAction::Pause => None,
+                let mut seen = HashSet::new();
+                let requested: Vec<String> = symbols
+                    .into_iter()
+                    .filter_map(|symbol| crate::scanner::normalize_symbol(&symbol))
+                    .filter(|symbol| seen.insert(symbol.clone()))
+                    .collect();
+                let requested_empty = requested.is_empty();
+
+                let valid_symbols: Vec<String> = match action {
+                    AiAction::Trade => {
+                        let mut resolved_seen = HashSet::new();
+                        requested
+                            .into_iter()
+                            .filter_map(|candidate| {
+                                match resolve_watchlist_symbol(&self.board(), &candidate) {
+                                    Some(symbol) if resolved_seen.insert(symbol.clone()) => {
+                                        Some(symbol)
+                                    }
+                                    Some(_) => None,
+                                    None => {
+                                        println!(
+                                            "[EXEC] AI picked {}, which is not on the scanner watchlist; ignoring it",
+                                            candidate.to_uppercase()
+                                        );
+                                        None
+                                    }
+                                }
+                            })
+                            .collect()
+                    }
+                    AiAction::Pause => Vec::new(),
                 };
 
-                println!(
-                    "[EXEC] AI gate {}{} — {}",
-                    action.as_str(),
-                    valid_symbol
-                        .as_deref()
-                        .map(|symbol| format!(" {}", symbol.to_uppercase()))
-                        .unwrap_or_default(),
-                    reason
-                );
+                if action == AiAction::Trade {
+                    if requested_empty {
+                        println!("[EXEC] AI sent TRADE without any symbol; gate stays closed");
+                    }
+                    println!(
+                        "[EXEC] AI gate TRADE {} — {}",
+                        format_gate_symbols(&valid_symbols),
+                        reason
+                    );
+                    if valid_symbols.is_empty() && !requested_empty {
+                        println!(
+                            "[EXEC] gate stays closed: none of the AI pairs is on the scanner watchlist"
+                        );
+                    }
+                } else {
+                    println!("[EXEC] AI gate PAUSE — {reason}");
+                }
                 if action == AiAction::Pause && !self.portfolio.position.is_flat() {
                     println!(
                         "[EXEC] entries disabled by the AI; the open position keeps its TP/SL"
@@ -538,7 +589,7 @@ impl Executor {
                 }
                 self.gate = Gate {
                     action,
-                    symbol: valid_symbol,
+                    symbols: valid_symbols,
                     reason,
                     at: Some(Instant::now()),
                 };
@@ -596,11 +647,7 @@ impl Executor {
                 symbol.to_uppercase(),
                 signal.side.as_str(),
                 self.gate.action.as_str(),
-                self.gate
-                    .symbol
-                    .as_deref()
-                    .map(|symbol| symbol.to_uppercase())
-                    .unwrap_or_else(|| "-".to_string()),
+                format_gate_symbols(&self.gate.symbols),
                 self.gate.reason
             );
             return;
@@ -1453,10 +1500,10 @@ mod tests {
         Executor::new(cfg, ExecutionMode::Paper, board, tx).expect("paper executor must build")
     }
 
-    fn verdict(symbol: &str) -> ExecutionCommand {
+    fn verdict(symbols: &[&str]) -> ExecutionCommand {
         ExecutionCommand::Verdict {
             action: AiAction::Trade,
-            symbol: Some(symbol.into()),
+            symbols: symbols.iter().map(|symbol| (*symbol).to_string()).collect(),
             reason: "test".into(),
         }
     }
@@ -1613,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_needs_a_fresh_trade_verdict_for_the_same_symbol() {
+    fn the_gate_needs_a_fresh_trade_verdict_covering_the_symbol() {
         let now = Instant::now();
         let ttl = Duration::from_secs(60);
         let symbol = "btcusdt";
@@ -1622,7 +1669,7 @@ mod tests {
         assert!(!gate.permits(symbol, ttl, now));
 
         gate.action = AiAction::Trade;
-        gate.symbol = Some(symbol.into());
+        gate.symbols = vec![symbol.into()];
         assert!(
             !gate.permits(symbol, ttl, now),
             "a verdict without a timestamp is stale"
@@ -1635,8 +1682,25 @@ mod tests {
         assert!(gate.permits(symbol, ttl, now));
         assert!(
             !gate.permits("ethusdt", ttl, now),
-            "a verdict for one pair cannot open another"
+            "a pair outside the AI list stays closed"
         );
+
+        gate.symbols.push("ethusdt".into());
+        assert!(gate.permits("btcusdt", ttl, now));
+        assert!(
+            gate.permits("ethusdt", ttl, now),
+            "every pair the AI cleared opens the gate"
+        );
+    }
+
+    #[test]
+    fn the_gate_log_lists_every_cleared_pair() {
+        assert_eq!(
+            format_gate_symbols(&["btcusdt".into(), "listausdt".into(), "trumpusdt".into()]),
+            "3 pairs: BTCUSDT, LISTAUSDT, TRUMPUSDT"
+        );
+        assert_eq!(format_gate_symbols(&["btcusdt".into()]), "1 pair: BTCUSDT");
+        assert_eq!(format_gate_symbols(&[]), "no watchlist pairs");
     }
 
     #[tokio::test]
@@ -1645,7 +1709,7 @@ mod tests {
         publish(&board, "btcusdt", "65000", "65001", "65000.5");
         let mut executor = executor(config(), board.clone());
 
-        assert!(executor.handle_command(verdict("btcusdt")).await);
+        assert!(executor.handle_command(verdict(&["btcusdt"])).await);
         executor
             .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
             .await;
@@ -1685,7 +1749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_verdict_for_one_pair_does_not_open_another() {
+    async fn a_pair_outside_the_ai_list_is_not_traded() {
         let board = board_with(&[
             ("btcusdt", "0.000001", "0.01"),
             ("listausdt", "1", "0.0001"),
@@ -1694,8 +1758,8 @@ mod tests {
         publish(&board, "listausdt", "0.13", "0.1301", "0.13");
         let mut executor = executor(config(), board.clone());
 
-        // The AI chose LISTA; a BTC dislocation must not be traded.
-        executor.handle_command(verdict("listausdt")).await;
+        // The AI cleared only LISTA; a BTC dislocation must not be traded.
+        executor.handle_command(verdict(&["listausdt"])).await;
         executor
             .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
             .await;
@@ -1710,12 +1774,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_multi_pair_verdict_trades_whichever_listed_pair_dislocates() {
+        let board = board_with(&[
+            ("btcusdt", "0.000001", "0.01"),
+            ("listausdt", "1", "0.0001"),
+            ("trumpusdt", "1", "0.0001"),
+        ]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        publish(&board, "listausdt", "0.13", "0.1301", "0.13");
+        publish(&board, "trumpusdt", "2", "2.001", "2");
+
+        for (symbol, ask) in [("btcusdt", "65001"), ("listausdt", "0.1301")] {
+            let mut executor = executor(config(), board.clone());
+            executor
+                .handle_command(verdict(&["btcusdt", "listausdt", "trumpusdt"]))
+                .await;
+            assert_eq!(executor.gate.symbols.len(), 3);
+
+            executor
+                .handle_command(ExecutionCommand::Signal(buy_signal(symbol, ask)))
+                .await;
+
+            assert!(
+                executor.working.is_none(),
+                "the marketable order on {symbol} must fill"
+            );
+            assert!(
+                executor.portfolio.position.qty() > Decimal::ZERO,
+                "an anomaly on any listed pair must open a position"
+            );
+            assert_eq!(executor.open_symbol.as_deref(), Some(symbol));
+        }
+    }
+
+    #[tokio::test]
+    async fn pairs_outside_the_watchlist_are_dropped_from_a_verdict() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board);
+
+        executor
+            .handle_command(verdict(&["btcusdt", "fakeusdt"]))
+            .await;
+
+        assert_eq!(executor.gate.symbols, vec!["btcusdt"]);
+        assert!(executor.gate.at.is_some());
+        assert!(
+            !executor
+                .gate
+                .permits("fakeusdt", Duration::from_secs(60), Instant::now()),
+            "a hallucinated pair must never open the gate"
+        );
+
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
+            .await;
+        assert_eq!(executor.open_symbol.as_deref(), Some("btcusdt"));
+    }
+
+    #[tokio::test]
+    async fn bare_base_symbols_resolve_to_watchlist_pairs() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01"), ("xmrusdt", "0.01", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        publish(&board, "xmrusdt", "100", "100.01", "100");
+        let mut executor = executor(config(), board);
+
+        // DeepSeek sometimes returns `XMR` instead of `XMRUSDT`; the gate must
+        // still match the streamed market, and a duplicate must not repeat.
+        executor
+            .handle_command(verdict(&["btcusdt", "xmr", "xmrusdt"]))
+            .await;
+
+        assert_eq!(executor.gate.symbols, vec!["btcusdt", "xmrusdt"]);
+
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("xmrusdt", "100.01")))
+            .await;
+        assert_eq!(executor.open_symbol.as_deref(), Some("xmrusdt"));
+    }
+
+    #[tokio::test]
     async fn a_sell_signal_cannot_open_a_short_on_spot() {
         let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
         publish(&board, "btcusdt", "65000", "65001", "65000.5");
         let mut executor = executor(config(), board);
 
-        executor.handle_command(verdict("btcusdt")).await;
+        executor.handle_command(verdict(&["btcusdt"])).await;
 
         let signal = Signal {
             symbol: "btcusdt".into(),
@@ -1738,7 +1882,7 @@ mod tests {
         publish(&board, "btcusdt", "65000", "65001", "65000.5");
         let mut executor = executor(config(), board);
 
-        executor.handle_command(verdict("btcusdt")).await;
+        executor.handle_command(verdict(&["btcusdt"])).await;
         executor
             .handle_command(ExecutionCommand::Signal(buy_signal("ethusdt", "3000")))
             .await;
@@ -1753,7 +1897,7 @@ mod tests {
         publish(&board, "listausdt", "0.13", "0.1301", "0.13");
         let mut executor = executor(config(), board.clone());
 
-        executor.handle_command(verdict("listausdt")).await;
+        executor.handle_command(verdict(&["listausdt"])).await;
         executor
             .handle_command(ExecutionCommand::Signal(buy_signal("listausdt", "0.1301")))
             .await;

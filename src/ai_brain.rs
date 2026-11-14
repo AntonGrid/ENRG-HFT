@@ -16,7 +16,7 @@ const MODEL: &str = "deepseek-chat";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The exact contract sent to the model.
-pub const SYSTEM_PROMPT: &str = "Ты — риск-менеджер мульти-парного скальпинг-бота на HTX. Тебе дают список USDT-пар с 24ч волатильностью, изменением цены, объёмом и текущим спредом. Выбери ОДНУ пару, где движение сильнее всего и спред приемлем, либо PAUSE. Верни ТОЛЬКО валидный JSON без markdown-разметки: {\"action\": \"TRADE\" | \"PAUSE\", \"symbol\": \"<пара в нижнем регистре или пустая строка>\", \"reason\": \"краткая причина\"}";
+pub const SYSTEM_PROMPT: &str = "Ты — риск-менеджер мульти-парного скальпинг-бота на HTX. Тебе дают список USDT-пар с 24ч волатильностью, изменением цены, объёмом и текущим спредом. Выбери БОЛЬШИНСТВО пар, пригодных для скальпинга (все, где движение и спред приемлемы), самые привлекательные первыми; не ограничивайся одной парой. Если пригодных нет — PAUSE с пустым массивом. Верни ТОЛЬКО валидный JSON без markdown-разметки: {\"action\": \"TRADE\" | \"PAUSE\", \"symbols\": [\"<пары в нижнем регистре>\"], \"reason\": \"краткая причина\"}";
 
 /// What the bot is allowed to do after the model has spoken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,14 +36,51 @@ impl AiAction {
 }
 
 /// The model's answer. `reason` is intentionally free-form: it is logged, not
-/// parsed. `symbol` names the pair the model wants to trade; the executor
-/// re-validates it against the live scanner watchlist before acting.
+/// parsed. `symbols` names every pair the model cleared, most promising first;
+/// the executor re-validates the list against the live scanner watchlist before
+/// opening the gate. The legacy singular `symbol` field is still accepted so an
+/// older prompt or a model that ignores the array contract cannot wedge the bot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiDecision {
     pub action: AiAction,
-    #[serde(default)]
-    pub symbol: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_symbols")]
+    pub symbols: Vec<String>,
     pub reason: String,
+}
+
+/// Wire shape that accepts both the new `symbols` array and the legacy singular
+/// `symbol`. Parsing both at once is deliberate: a model may repeat the old
+/// field next to the new one, and that must not turn a valid verdict into an
+/// error.
+#[derive(Deserialize)]
+struct WireDecision {
+    action: AiAction,
+    #[serde(default, deserialize_with = "deserialize_symbols")]
+    symbols: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_symbols")]
+    symbol: Vec<String>,
+    reason: String,
+}
+
+/// Accepts `["a", "b"]`, a single `"a"`, or a comma-separated `"a, b"` and
+/// treats a missing/null field as an empty list.
+fn deserialize_symbols<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawSymbols {
+        Many(Vec<String>),
+        One(String),
+    }
+
+    let raw = Option::<RawSymbols>::deserialize(deserializer)?;
+    Ok(match raw {
+        None => Vec::new(),
+        Some(RawSymbols::Many(symbols)) => symbols,
+        Some(RawSymbols::One(symbols)) => symbols.split(',').map(str::to_string).collect(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,12 +172,24 @@ pub async fn ask_deepseek(
 }
 
 /// Parses the model's text into a decision, tolerating markdown fences and
-/// chatter around the JSON object. The symbol is normalised to HTX's lower-case
-/// form, so `"LISTA-USDT"` and `"listausdt"` are the same market.
+/// chatter around the JSON object. Every pair is normalised to HTX's lower-case
+/// form, so `"LISTA-USDT"` and `"listausdt"` are the same market, and duplicates
+/// (plus blank rows) are dropped while the model's ranking is preserved.
 pub fn parse_decision(content: &str) -> Result<AiDecision, serde_json::Error> {
-    let mut decision: AiDecision = serde_json::from_str(sanitize_json(content))?;
-    decision.symbol = decision.symbol.and_then(|symbol| normalize_symbol(&symbol));
-    Ok(decision)
+    let wire: WireDecision = serde_json::from_str(sanitize_json(content))?;
+    let mut seen = std::collections::HashSet::new();
+    let symbols = wire
+        .symbols
+        .iter()
+        .chain(wire.symbol.iter())
+        .filter_map(|symbol| normalize_symbol(symbol))
+        .filter(|symbol| seen.insert(symbol.clone()))
+        .collect();
+    Ok(AiDecision {
+        action: wire.action,
+        symbols,
+        reason: wire.reason,
+    })
 }
 
 /// Strips ```json fences and everything before the first `{` / after the last
@@ -177,22 +226,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_plain_decision_with_a_symbol() {
-        let decision =
-            parse_decision(r#"{"action":"TRADE","symbol":"LISTA-USDT","reason":"pump"}"#)
-                .expect("plain JSON must parse");
+    fn parses_plain_decision_with_a_pair_list() {
+        let decision = parse_decision(
+            r#"{"action":"TRADE","symbols":["LISTA-USDT","trumpusdt"],"reason":"pump"}"#,
+        )
+        .expect("plain JSON must parse");
         assert_eq!(decision.action, AiAction::Trade);
-        assert_eq!(decision.symbol.as_deref(), Some("listausdt"));
+        assert_eq!(decision.symbols, vec!["listausdt", "trumpusdt"]);
         assert_eq!(decision.reason, "pump");
     }
 
     #[test]
     fn parses_fenced_decision() {
         let content =
-            "```json\n{\"action\":\"PAUSE\",\"symbol\":\"\",\"reason\":\"spread too wide\"}\n```";
+            "```json\n{\"action\":\"PAUSE\",\"symbols\":[],\"reason\":\"spread too wide\"}\n```";
         let decision = parse_decision(content).expect("fenced JSON must parse");
         assert_eq!(decision.action, AiAction::Pause);
-        assert_eq!(decision.symbol, None);
+        assert!(decision.symbols.is_empty());
     }
 
     #[test]
@@ -201,9 +251,40 @@ mod tests {
             "Sure: {\"action\": \"PAUSE\", \"reason\": \"calm\"} — no pair worth trading.";
         let decision = parse_decision(content).expect("embedded JSON must parse");
         assert_eq!(decision.action, AiAction::Pause);
+        assert!(
+            decision.symbols.is_empty(),
+            "a missing pair list defaults to no pairs"
+        );
+    }
+
+    #[test]
+    fn accepts_the_legacy_single_symbol_and_comma_lists() {
+        let one = parse_decision(r#"{"action":"TRADE","symbol":"LISTA-USDT","reason":"old"}"#)
+            .expect("legacy JSON must parse");
+        assert_eq!(one.symbols, vec!["listausdt"]);
+
+        let many =
+            parse_decision(r#"{"action":"TRADE","symbol":"LISTA-USDT, TRUMPUSDT","reason":"old"}"#)
+                .expect("comma-separated JSON must parse");
+        assert_eq!(many.symbols, vec!["listausdt", "trumpusdt"]);
+
+        let both = parse_decision(
+            r#"{"action":"TRADE","symbols":["BTCUSDT"],"symbol":"LISTA-USDT","reason":"old"}"#,
+        )
+        .expect("both fields must parse");
+        assert_eq!(both.symbols, vec!["btcusdt", "listausdt"]);
+    }
+
+    #[test]
+    fn normalises_and_deduplicates_pairs_in_order() {
+        let decision = parse_decision(
+            r#"{"action":"TRADE","symbols":["TRUMP-USDT","listausdt","trumpusdt","","  "],"reason":"ranked"}"#,
+        )
+        .expect("duplicates must be tolerated");
         assert_eq!(
-            decision.symbol, None,
-            "a missing symbol defaults to no pair"
+            decision.symbols,
+            vec!["trumpusdt", "listausdt"],
+            "blank rows and repeats are dropped without reordering"
         );
     }
 
@@ -216,11 +297,11 @@ mod tests {
     fn serialises_action_in_uppercase() {
         let decision = AiDecision {
             action: AiAction::Trade,
-            symbol: Some("listausdt".into()),
+            symbols: vec!["listausdt".into(), "trumpusdt".into()],
             reason: "test".to_string(),
         };
         let json = serde_json::to_string(&decision).expect("decision must serialise");
         assert!(json.contains("\"action\":\"TRADE\""));
-        assert!(json.contains("\"symbol\":\"listausdt\""));
+        assert!(json.contains("\"symbols\":[\"listausdt\",\"trumpusdt\"]"));
     }
 }
