@@ -64,12 +64,14 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
   passive ones until the market trades through them. Fees are charged on both
   sides, so paper PnL is honest about spread and commissions.
 - **Live mode** signs every request with HMAC-SHA256 (`StringToSign =
-  METHOD\nhost\npath\nsorted-params`), sends limit orders priced through the
-  touch with `EXEC_SLIPPAGE_BPS`, polls order state once a second, cancels
-  unfilled entries after `EXEC_ORDER_TTL_SECS`, and logs account balances at
-  boot. The live USDT balance is mirrored into the AI context (`equity`/`cash`)
-  every 30 seconds and right after each fill; an entry is capped to the
-  spendable balance so a small account is not rejected by the venue.
+  METHOD\nhost\npath\nsorted-params`), sends POST parameters as an
+  `application/json` body (only auth fields are signed), prices limit orders
+  through the touch with `EXEC_SLIPPAGE_BPS`, polls order state once a second,
+  cancels unfilled entries after `EXEC_ORDER_TTL_SECS`, and logs account
+  balances at boot. The live USDT balance is mirrored into the AI context
+  (`equity`/`cash`) every 30 seconds and right after each fill; an entry is
+  capped to the spendable balance so a small account is not rejected by the
+  venue.
 - **Ctrl-C** is a kill switch: the guard latches, working orders are cancelled,
   the position is flattened with one aggressive order and a final report is
   printed.
@@ -180,7 +182,7 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-106 unit tests, no network required: Decimal anomaly windows, scanner filtering
+108 unit tests, no network required: Decimal anomaly windows, scanner filtering
 and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
 normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
 request signing against an independent golden vector, order/balance parsers,

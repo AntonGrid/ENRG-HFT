@@ -30,6 +30,8 @@ use crate::execution::{ExecutionError, OrderReport, OrderRequest, OrderStatus};
 pub const DEFAULT_REST_URL: &str = "https://api.htx.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+/// HTX rejects POSTs whose media type carries a charset suffix.
+const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// One currency on the account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,34 +126,21 @@ impl HtxRest {
         path: &str,
         params: BTreeMap<String, String>,
     ) -> Result<Value, ExecutionError> {
-        let mut signed = params;
-        signed.insert("AccessKeyId".into(), self.access_key.clone());
-        signed.insert("SignatureMethod".into(), SIGNATURE_METHOD.into());
-        signed.insert("SignatureVersion".into(), SIGNATURE_VERSION.into());
-        signed.insert(
-            "Timestamp".into(),
-            Utc::now().format(TIMESTAMP_FORMAT).to_string(),
+        let (url, body) = self.signed_request(
+            method,
+            path,
+            &Utc::now().format(TIMESTAMP_FORMAT).to_string(),
+            &params,
         );
 
-        let signature = signing::sign(&self.secret_key, method.as_str(), &self.host, path, &signed);
-        signed.insert("Signature".into(), signature);
-
-        let request = if method == Method::GET {
-            let url = format!(
-                "{}{}?{}",
-                self.base_url,
-                path,
-                signing::canonical_query(&signed)
-            );
-            self.http.get(url)
-        } else {
-            self.http
-                .post(format!("{}{}", self.base_url, path))
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
-                .body(signing::canonical_query(&signed))
+        let request = match body {
+            None => self.http.get(url),
+            Some(body) => self
+                .http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+                .body(body),
         };
 
         let response = request.send().await?;
@@ -240,6 +229,51 @@ impl HtxRest {
         let path = format!("/v1/order/orders/{order_id}/cancel");
         self.call(Method::POST, &path, BTreeMap::new()).await?;
         Ok(())
+    }
+
+    /// Builds the signed URL and, for POST, the JSON body.
+    ///
+    /// HTX signs only the authentication fields on POST; order parameters live
+    /// in an `application/json` body. GET keeps every parameter in the signed
+    /// query string.
+    fn signed_request(
+        &self,
+        method: Method,
+        path: &str,
+        timestamp: &str,
+        params: &BTreeMap<String, String>,
+    ) -> (String, Option<String>) {
+        let mut auth = BTreeMap::new();
+        auth.insert("AccessKeyId".into(), self.access_key.clone());
+        auth.insert("SignatureMethod".into(), SIGNATURE_METHOD.into());
+        auth.insert("SignatureVersion".into(), SIGNATURE_VERSION.into());
+        auth.insert("Timestamp".into(), timestamp.to_string());
+
+        let mut query = if method == Method::GET {
+            params.clone()
+        } else {
+            BTreeMap::new()
+        };
+        query.extend(auth);
+
+        let signature = signing::sign(&self.secret_key, method.as_str(), &self.host, path, &query);
+        query.insert("Signature".into(), signature);
+
+        let url = format!(
+            "{}{}?{}",
+            self.base_url,
+            path,
+            signing::canonical_query(&query)
+        );
+        let body = if method == Method::GET {
+            None
+        } else {
+            Some(
+                serde_json::to_string(params)
+                    .expect("a map of strings is always serialisable as JSON"),
+            )
+        };
+        (url, body)
     }
 }
 
@@ -422,6 +456,73 @@ mod tests {
         assert_eq!(params.get("price").unwrap(), "65000.1");
         assert_eq!(params.get("source").unwrap(), "api");
         assert_eq!(params.get("client-order-id").unwrap(), "enrg-42");
+    }
+
+    #[test]
+    fn post_sends_a_json_body_and_signs_only_auth_fields() {
+        let rest = HtxRest::new("https://api.htx.com", "key", "secret").unwrap();
+        let request = OrderRequest {
+            symbol: "COMPUSDT".into(),
+            side: crate::execution::Side::Buy,
+            amount: dec("1.25"),
+            price: dec("18.47"),
+            client_order_id: "enrg-77".into(),
+        };
+        let params = order_params(&request, 12345678);
+
+        let (url, body) = rest.signed_request(
+            Method::POST,
+            "/v1/order/orders/place",
+            "2026-11-14T20:00:00",
+            &params,
+        );
+
+        assert_eq!(JSON_CONTENT_TYPE, "application/json");
+        assert!(!JSON_CONTENT_TYPE.contains("charset"));
+
+        let query = url.split_once('?').expect("signed URL has a query").1;
+        assert!(query.contains("AccessKeyId=key"));
+        assert!(query.contains("SignatureMethod=HmacSHA256"));
+        assert!(query.contains("SignatureVersion=2"));
+        assert!(query.contains("Timestamp=2026-11-14T20%3A00%3A00"));
+        assert!(query.contains("Signature="));
+        // Golden vector from Python hmac/hashlib over the auth fields only.
+        assert!(query.contains("Signature=rZ2k8VBT6eoNLSQfFbktub5pDP0L5dOJ3W7hMA1OzHU%3D"));
+        // Order parameters belong to the JSON body, not the signed query.
+        assert!(!query.contains("symbol="));
+        assert!(!query.contains("amount="));
+        assert!(!query.contains("account-id="));
+
+        let body = body.expect("POST carries a body");
+        let value: Value = serde_json::from_str(&body).expect("body must be JSON");
+        assert_eq!(value["symbol"], "compusdt");
+        assert_eq!(value["amount"], "1.25");
+        assert_eq!(value["price"], "18.47");
+        assert_eq!(value["client-order-id"], "enrg-77");
+        assert!(value.get("AccessKeyId").is_none());
+        assert!(value.get("Signature").is_none());
+    }
+
+    #[test]
+    fn get_keeps_every_parameter_in_the_signed_query() {
+        let rest = HtxRest::new("https://api.htx.com", "key", "secret").unwrap();
+        let mut params = BTreeMap::new();
+        params.insert("order-id".into(), "1234567890".into());
+        params.insert("symbol".into(), "btcusdt".into());
+
+        let (url, body) = rest.signed_request(
+            Method::GET,
+            "/v1/order/orders",
+            "2026-11-14T20:00:00",
+            &params,
+        );
+
+        let query = url.split_once('?').expect("signed URL has a query").1;
+        assert!(query.contains("order-id=1234567890"));
+        assert!(query.contains("symbol=btcusdt"));
+        assert!(query.contains("AccessKeyId=key"));
+        assert!(query.contains("Signature="));
+        assert!(body.is_none());
     }
 
     #[test]
