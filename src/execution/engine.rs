@@ -605,6 +605,20 @@ impl Executor {
     /// A dislocation arrived: gate, size, risk-check, place.
     async fn try_enter(&mut self, signal: Signal) {
         let symbol = signal.symbol.clone();
+
+        // Spot is long-only. A SELL is only ever produced by the exit path
+        // (`maybe_exit` / kill switch) for a position that is already open; it
+        // must never be interpreted as an entry signal, even if one slips
+        // through from an older strategy build.
+        if signal.side != Side::Buy {
+            println!(
+                "[EXEC] skip {} {}: spot is long-only; SELL only closes an open position",
+                symbol.to_uppercase(),
+                signal.side.as_str()
+            );
+            return;
+        }
+
         if !self.board().is_active(&symbol) {
             println!(
                 "[EXEC] skip {} {}: not on the scanner watchlist",

@@ -7,17 +7,21 @@ Hybrid **multi-pair** scalping bot — six layers, one binary.
 | 0.5 Scanner | `src/scanner.rs` | Every `SCAN_INTERVAL_SECS` pulls `GET /market/tickers`, keeps liquid USDT spot pairs (24h quote volume ≥ `SCAN_MIN_QUOTE_VOLUME_USDT`), drops stablecoins and leveraged tokens, ranks the rest by 24h amplitude and reads per-pair `amount-precision` / `price-precision` from `/v1/common/symbols`. |
 | 1. Fast hands | `src/exchange/htx.rs` | One HTX WebSocket (`wss://api.htx.com/ws`, fallback `wss://api.huobi.pro/ws`) for **all** scanned pairs: IPv4-only dial, gzip decoding, heartbeat, live `sub`/`unsub` as the watchlist rotates, per-symbol throttled logs, 15s stall watchdog and automatic reconnect. |
 | 2. Mathematics | `src/quant_core.rs` | Exact `Decimal` anomaly detection: more than 1% price move inside the last 10 ticks. |
-| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, directional `Signal { symbol, side, price, … }`, and the multi-pair context read by DeepSeek and the executor. |
+| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, **long-only** `Signal { symbol, side: BUY, price, … }` on a >1% dip (pumps are ignored), and the multi-pair context read by DeepSeek and the executor. |
 | 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager with a strict `{"action":"TRADE"\|"PAUSE","symbols":["…"],"reason":"…"}` contract, polled every `AI_INTERVAL_SECS`. |
 | 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders **on any pair the AI cleared**. |
 
 The AI is a **gate and a pair selector**, not a signal: a `TRADE` verdict opens
 the gate for every symbol in its list for `EXEC_GATE_TTL_SECS`; the quant signal
-on any of those symbols decides *when* and in which direction (momentum across
-the anomaly window). A stale verdict, a `PAUSE`, a symbol outside the scanner
-watchlist or a missing DeepSeek key keeps entries disabled while the bot keeps
-streaming data. Pair names are normalised (`LISTA-USDT` → `listausdt`); a bare
-base ticker such as `XMR` is accepted only when `XMRUSDT` is on the watchlist.
+on any of those symbols decides *when* to buy. The strategy is **long-only**:
+a >1% drop inside the anomaly window emits `BUY` (buying the rebound), while a
+>1% pump emits nothing — buying the top of a move is not a spot entry. A `SELL`
+is never an entry signal: the executor only sells the position it already holds
+(take-profit, stop-loss, timeout or kill switch). A stale verdict, a `PAUSE`, a
+symbol outside the scanner watchlist or a missing DeepSeek key keeps entries
+disabled while the bot keeps streaming data. Pair names are normalised
+(`LISTA-USDT` → `listausdt`); a bare base ticker such as `XMR` is accepted only
+when `XMRUSDT` is on the watchlist.
 
 ## Market scanner
 
@@ -152,8 +156,8 @@ watchlist:
 account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 [AI] 2026-11-14 16:27:02 UTC decision: TRADE [LISTAUSDT, FUNUSDT, TRUMPUSDT] — momentum across the watchlist
 [EXEC] AI gate TRADE 3 pairs: LISTAUSDT, FUNUSDT, TRUMPUSDT — momentum across the watchlist
-[SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) — >1% range in the last 10 ticks
-[EXEC] placing BUY 191.7 LISTAUSDT @ 0.1305 (signal: >1% range in the last 10 ticks)
+[SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) — >1% dip across 10 ticks (buying the rebound)
+[EXEC] placing BUY 191.7 LISTAUSDT @ 0.1305 (signal: >1% dip across 10 ticks (buying the rebound))
 [EXEC] order paper-1 accepted: filled
 [EXEC] entry fill 191.7 LISTAUSDT @ 0.1305 (fee 0.0500)
 [EXEC] closing position: SELL 191.7 LISTAUSDT @ 0.1316 — take-profit (pnl 0.84%)
@@ -182,7 +186,7 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-108 unit tests, no network required: Decimal anomaly windows, scanner filtering
+109 unit tests, no network required: Decimal anomaly windows, scanner filtering
 and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
 normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
 request signing against an independent golden vector, order/balance parsers,

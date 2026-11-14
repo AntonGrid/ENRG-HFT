@@ -6,7 +6,9 @@
 //!
 //! Two consumers read the same board:
 //!
-//! * the strategy emits a [`Signal`] with the symbol that produced it;
+//! * the strategy emits a [`Signal`] with the symbol that produced it. Spot is
+//!   long-only: only a downside dislocation produces `BUY`, and `SELL` is left
+//!   entirely to the executor's exit path for an already-open position;
 //! * the executor reads the freshest [`MarketSnapshot`] for the symbol it is
 //!   about to trade or is currently holding, and the AI layer reads
 //!   [`MarketBoard::describe_pairs`] for its minute-by-minute verdict.
@@ -67,7 +69,7 @@ impl MarketSnapshot {
     }
 }
 
-/// A dislocation worth considering. The executor decides whether to act.
+/// A long-only entry opportunity. The executor decides whether to act.
 #[derive(Debug, Clone)]
 pub struct Signal {
     pub symbol: String,
@@ -97,7 +99,8 @@ impl Book {
         }
     }
 
-    /// Returns `(side, price, move_pct, reason)` on a fresh dislocation.
+    /// Returns `(side, price, move_pct, reason)` on a fresh dip. The side is
+    /// always [`Side::Buy`]: spot never enters short.
     fn on_event(&mut self, event: &MarketEvent) -> Option<(Side, Decimal, Decimal, String)> {
         match event {
             MarketEvent::Trade {
@@ -149,29 +152,35 @@ impl Book {
         let anomaly = quant_core::detect_anomaly(&prices);
         self.snapshot.anomaly = anomaly;
 
-        if !anomaly
-            || self
-                .last_anomaly
-                .is_some_and(|at| at.elapsed() < ANOMALY_COOLDOWN)
+        if !anomaly {
+            return None;
+        }
+
+        // Spot is long-only: a pump is not an entry. Buying strength at the
+        // top of a >1% move is exactly the trade the old directional signal
+        // used to take, and on spot it can only end in a losing round trip.
+        // Only downside dislocations arm an entry.
+        let first = self.window.front().copied().unwrap_or(price);
+        if price >= first {
+            return None;
+        }
+
+        if self
+            .last_anomaly
+            .is_some_and(|at| at.elapsed() < ANOMALY_COOLDOWN)
         {
             return None;
         }
+        // A pump is ignored above, so it must not arm the cooldown either: the
+        // next real dip is allowed to signal immediately.
         self.last_anomaly = Some(Instant::now());
 
-        // Momentum: the direction of the net move across the window.
-        let first = self.window.front().copied().unwrap_or(price);
-        let side = if price >= first {
-            Side::Buy
-        } else {
-            Side::Sell
-        };
-
         Some((
-            side,
+            Side::Buy,
             price,
             self.snapshot.move_pct.unwrap_or_default().round_dp(3),
             format!(
-                ">{}% range in the last {} ticks",
+                ">{}% dip across {} ticks (buying the rebound)",
                 quant_core::ANOMALY_THRESHOLD_PCT,
                 prices.len()
             ),
@@ -388,30 +397,41 @@ mod tests {
     }
 
     #[test]
-    fn one_percent_up_move_emits_a_buy_signal_for_that_symbol() {
+    fn a_pump_does_not_emit_an_entry_signal() {
         let mut board = board();
         assert!(board.apply(&trade("listausdt", "100")).is_none());
-        let signal = board
-            .apply(&trade("listausdt", "101.5"))
-            .expect("a 1.5% move must produce a signal");
-
-        assert_eq!(signal.symbol, "listausdt");
-        assert_eq!(signal.side, Side::Buy);
-        assert_eq!(signal.price, dec("101.5"));
-        assert_eq!(signal.move_pct, dec("1.5"));
+        assert!(
+            board.apply(&trade("listausdt", "101.5")).is_none(),
+            "buying a >1% pump on spot is not a long-only entry"
+        );
         assert!(board.snapshot("listausdt").unwrap().anomaly);
     }
 
     #[test]
-    fn one_percent_down_move_emits_a_sell_signal() {
+    fn a_dip_emits_a_buy_signal_for_that_symbol() {
         let mut board = board();
         board.apply(&trade("btcusdt", "100"));
         let signal = board
             .apply(&trade("btcusdt", "98.5"))
-            .expect("a 1.5% drop must produce a signal");
+            .expect("a 1.5% drop must produce a dip entry");
 
         assert_eq!(signal.symbol, "btcusdt");
-        assert_eq!(signal.side, Side::Sell);
+        assert_eq!(signal.side, Side::Buy);
+        assert_eq!(signal.price, dec("98.5"));
+        assert_eq!(signal.move_pct, dec("1.523"));
+        assert!(signal.reason.contains("dip"));
+    }
+
+    #[test]
+    fn a_pump_does_not_block_the_next_dip() {
+        let mut board = board();
+        board.apply(&trade("btcusdt", "100"));
+        assert!(board.apply(&trade("btcusdt", "101.5")).is_none());
+
+        let signal = board
+            .apply(&trade("btcusdt", "98.5"))
+            .expect("the ignored pump must not arm the dip cooldown");
+        assert_eq!(signal.side, Side::Buy);
     }
 
     #[test]
@@ -427,11 +447,11 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_suppresses_back_to_back_signals() {
+    fn cooldown_suppresses_back_to_back_dip_signals() {
         let mut board = board();
         board.apply(&trade("btcusdt", "100"));
-        assert!(board.apply(&trade("btcusdt", "102")).is_some());
-        assert!(board.apply(&trade("btcusdt", "104")).is_none());
+        assert!(board.apply(&trade("btcusdt", "98.5")).is_some());
+        assert!(board.apply(&trade("btcusdt", "97")).is_none());
     }
 
     #[test]
