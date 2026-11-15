@@ -91,15 +91,24 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
   METHOD\nhost\npath\nsorted-params`), sends POST parameters as an
   `application/json` body (only auth fields are signed), polls order state once
   a second, and logs every non-zero account balance at boot.
-  Entries use `*-limit-maker` (post-only): a buy rests on the best bid, so it
-  never pays taker fees or crosses the spread. Both exits use `*-market` orders,
-  because getting out matters more than the fee: the hard stop must fire at any
-  cost, and a trailing stop that cannot fill is just a delayed stop-loss. An
-  accepted maker entry immediately appears in the local `Portfolio`
-  (`position_qty` / `avg_entry`, with paper cash reserved), so the AI context
-  and risk guard never see a flat book while the order is still resting; a
-  cancel or reject rolls the overlay back exactly. Unfilled maker entries are
-  cancelled after `EXEC_ORDER_TTL_SECS`.
+  Entries are split by pattern. A **breakout** is momentum, so it is sent as a
+  `buy-market` taker order: the very move the signal describes is what would
+  leave a passive bid behind. A **pullback** is bought into a dip, so it stays
+  post-only (`buy-limit-maker`), resting `EXEC_MAKER_OFFSET_TICKS` steps above
+  the best bid to sit at the front of the queue instead of its back. Both exits
+  use `*-market` orders, because getting out matters more than the fee: the hard
+  stop must fire at any cost, and a trailing stop that cannot fill is just a
+  delayed stop-loss. An accepted maker entry immediately appears in the local
+  `Portfolio` (`position_qty` / `avg_entry`, with paper cash reserved), so the AI
+  context and risk guard never see a flat book while the order is still resting;
+  a cancel or reject rolls the overlay back exactly. An unfilled entry is
+  cancelled after `EXEC_ORDER_TTL_SECS`, or immediately when the market runs more
+  than `EXEC_ENTRY_MAX_CHASE_BPS` above its limit (the signal no longer describes
+  the price). Cancels go to `/v1/order/orders/{id}/submitcancel`; a failed cancel
+  is retried on a 5s-per-attempt backoff capped at 60s, and after 10 attempts
+  entries are halted so a stuck order is loud instead of a request loop. In live
+  mode a cancel is followed by one last status query, so units that filled
+  between the last poll and the cancel are still booked.
   The live USDT balance is mirrored into the AI context (`equity`/`cash`) every
   30 seconds and right after each fill; an entry is capped to the spendable
   balance so a small account is not rejected by the venue.
@@ -166,7 +175,10 @@ short the venue would refuse. One position at a time across all pairs.
 | `EXEC_STOP_LOSS_PCT` | 0.7 | Hard stop at -0.7% |
 | `EXEC_TREND_EXIT` | true | Close the position when the trend filter flips |
 | `EXEC_COOLDOWN_SECS` | 10 | Pause between accepted entries |
-| `EXEC_ORDER_TTL_SECS` | 12 | Cancel an unfilled maker entry after this many seconds |
+| `EXEC_ORDER_TTL_SECS` | 30 | Cancel an unfilled entry after this many seconds |
+| `EXEC_BREAKOUT_TAKER` | true | Send breakout entries as `buy-market` (false: post-only like a pullback) |
+| `EXEC_MAKER_OFFSET_TICKS` | 1 | Venue steps above the bid a pullback entry rests at (never crossing) |
+| `EXEC_ENTRY_MAX_CHASE_BPS` | 20 | Cancel a resting entry once the mark is this far above its limit (0 disables) |
 
 Exits bypass the daily-loss halt and the cooldown, so an open position can
 always be closed.
@@ -258,6 +270,12 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 - An exit rejected with HTX `order-value-min-error` is logged once and the
   residual is dropped from local state, so the bot never spams the venue with an
   order that can never be filled.
+- Cancels use the v1 `submitcancel` endpoint (a `/cancel` path answers 404 with
+  an empty body, which no retry loop can distinguish from a network blip), are
+  retried with a capped backoff and halt entries after 10 failures. An order the
+  venue reports as non-existent is treated as terminal instead of being retried.
+- A market buy is sent to HTX with its **quote** amount: the venue spends
+  `amount` USDT on `buy-market`, not `amount` coins.
 - The executor never blocks the socket: it reads only the books of its own
   working order / open position from the shared board and trades from its own
   task.
@@ -268,7 +286,7 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-132 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
+142 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
 volume-spike detection, scanner filtering and ranking, per-symbol bar aggregation,
 the trend filter (breakout, pullback, chop, downtrend, warm-up, cooldown), watchlist
 pinning, the exit policy (hard stop, ATR trail, trend flip, unwarmed fallback),
@@ -278,4 +296,10 @@ portfolio PnL, every risk rejection, the paper broker's fill semantics and symbo
 isolation, sizing/rounding helpers, startup balance recovery (primary selection,
 dust filtering, unquoted assets, stop-loss protection) and full paper round-trips
 through the multi-pair executor. The exit path is also covered for the venue-minimum
-error that drops an unsellable residual instead of retrying.
+error that drops an unsellable residual instead of retrying. Entry routing is pinned
+too: breakout entries cross the spread, pullback entries rest one step above the bid
+without ever crossing, and a resting entry is cancelled once the market runs more than
+`EXEC_ENTRY_MAX_CHASE_BPS` above it. The cancel path itself is a golden-string test
+(`/submitcancel`), and the retry schedule is covered without a venue (backoff growth,
+cap, halt at the attempt limit, order-not-exist treated as terminal, market-buy quote
+amount).

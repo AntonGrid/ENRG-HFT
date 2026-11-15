@@ -8,7 +8,7 @@
 //! | `GET` | `/v1/account/accounts/{id}/balance` | balances |
 //! | `POST` | `/v1/order/orders/place` | new limit order |
 //! | `GET` | `/v1/order/orders/{id}` | order state |
-//! | `POST` | `/v1/order/orders/{id}/cancel` | cancel |
+//! | `POST` | `/v1/order/orders/{id}/submitcancel` | cancel |
 //!
 //! Requests are signed with [`crate::execution::signing`]. Response parsing is
 //! split into pure functions so the wire format is covered by unit tests without
@@ -25,7 +25,7 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 
 use crate::execution::signing::{self, SIGNATURE_METHOD, SIGNATURE_VERSION};
-use crate::execution::{ExecutionError, OrderKind, OrderReport, OrderRequest, OrderStatus};
+use crate::execution::{ExecutionError, OrderKind, OrderReport, OrderRequest, OrderStatus, Side};
 
 pub const DEFAULT_REST_URL: &str = "https://api.htx.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -226,7 +226,7 @@ impl HtxRest {
     /// Cancels an order. Cancelling an already-terminal order is reported as an
     /// API error by HTX; callers treat it as "nothing left to cancel".
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
-        let path = format!("/v1/order/orders/{order_id}/cancel");
+        let path = cancel_path(order_id);
         self.call(Method::POST, &path, BTreeMap::new()).await?;
         Ok(())
     }
@@ -277,10 +277,28 @@ impl HtxRest {
     }
 }
 
+/// Path of the HTX v1 cancel endpoint for `order_id`.
+///
+/// The v1 spot API calls it `submitcancel`; `/v1/order/orders/{id}/cancel` does
+/// not exist and answers `404` with an empty body, which looks exactly like a
+/// transient failure to a retry loop and leaves the order resting forever. Kept
+/// as a function of its own so the wire path is pinned by a unit test.
+pub(crate) fn cancel_path(order_id: &str) -> String {
+    format!("/v1/order/orders/{order_id}/submitcancel")
+}
+
 fn order_params(request: &OrderRequest, account_id: i64) -> BTreeMap<String, String> {
     let mut params = BTreeMap::new();
     params.insert("account-id".into(), account_id.to_string());
-    params.insert("amount".into(), decimal_param(request.amount));
+    // HTX reads `amount` as quote currency (USDT) for a market buy and as the
+    // base quantity for every other type. A market buy therefore has to send the
+    // notional it is allowed to spend, rounded to the quote precision the venue
+    // accepts; sending the base quantity would spend that many USDT instead.
+    let amount = match (request.kind, request.side) {
+        (OrderKind::Market, Side::Buy) => quote_amount_param(request.notional()),
+        _ => decimal_param(request.amount),
+    };
+    params.insert("amount".into(), amount);
     params.insert("client-order-id".into(), request.client_order_id.clone());
     // HTX rejects `price` on market orders; a maker order must carry the
     // non-crossing limit price it was sized against.
@@ -294,6 +312,16 @@ fn order_params(request: &OrderRequest, account_id: i64) -> BTreeMap<String, Str
         request.kind.htx_order_type(request.side).into(),
     );
     params
+}
+
+/// Quote-currency amount for a market buy: four decimals are the most HTX
+/// reliably accepts, and rounding down can only under-spend.
+fn quote_amount_param(value: Decimal) -> String {
+    decimal_param(
+        value
+            .round_dp_with_strategy(4, rust_decimal::RoundingStrategy::ToZero)
+            .max(Decimal::ZERO),
+    )
 }
 
 /// `0.000380` -> `0.00038`; HTX rejects trailing-zero noise on some symbols.
@@ -481,6 +509,38 @@ mod tests {
         assert_eq!(params.get("type").unwrap(), "sell-market");
         assert_eq!(params.get("amount").unwrap(), "0.01");
         assert!(!params.contains_key("price"));
+    }
+
+    #[test]
+    fn a_market_buy_sends_the_quote_amount() {
+        // HTX spends `amount` USDT on `buy-market`, not `amount` coins: the
+        // taker entry must send its notional, or a 25 USDT order would buy 25
+        // coins' worth of a 1 USDT pair.
+        let request = OrderRequest {
+            symbol: "TRUMPUSDT".into(),
+            side: crate::execution::Side::Buy,
+            amount: dec("105.9"),
+            price: dec("0.9443"),
+            kind: OrderKind::Market,
+            client_order_id: "enrg-44".into(),
+        };
+
+        let params = order_params(&request, 12345678);
+        assert_eq!(params.get("type").unwrap(), "buy-market");
+        // 105.9 x 0.9443 = 100.00137 USDT, truncated to the venue's 4 decimals.
+        assert_eq!(params.get("amount").unwrap(), "100.0013");
+        assert!(!params.contains_key("price"));
+    }
+
+    #[test]
+    fn a_cancel_targets_the_v1_submitcancel_endpoint() {
+        // `/cancel` does not exist on HTX v1: it answers 404 with an empty body
+        // and the order is never cancelled.
+        assert_eq!(
+            cancel_path("1733465409390195"),
+            "/v1/order/orders/1733465409390195/submitcancel"
+        );
+        assert!(!cancel_path("1").ends_with("/cancel"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::execution::portfolio::Portfolio;
 use crate::execution::risk::{Intent, RiskGuard, RiskLimits};
 use crate::execution::{ExecutionError, OrderKind, OrderReport, OrderRequest, OrderStatus, Side};
 use crate::scanner::{is_tradable_usdt_symbol, normalize_symbol, Scanner, SpotQuote};
-use crate::strategy::{MarketBoard, MarketSnapshot, Signal};
+use crate::strategy::{EntryKind, MarketBoard, MarketSnapshot, Signal};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// How often a live order is re-queried (HTX rate limits are per second).
@@ -49,6 +49,15 @@ const RECOVERY_FILL_TIMEOUT: Duration = Duration::from_secs(15);
 const HTX_MIN_ORDER_VALUE_USDT: Decimal = Decimal::ONE;
 /// The venue error code returned when an order is below that minimum.
 const ORDER_VALUE_MIN_ERROR: &str = "order-value-min-error";
+/// First delay before retrying a cancel the venue refused; doubles per attempt
+/// until [`CANCEL_BACKOFF_MAX`].
+const CANCEL_BACKOFF_STEP: Duration = Duration::from_secs(5);
+/// Ceiling of the cancel retry backoff. A cancel that keeps failing is a stuck
+/// order, not a busy loop to be hammered every tick.
+const CANCEL_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Failed cancel attempts after which entries are halted: an order the venue
+/// refuses to cancel is unmanaged exposure and needs an operator.
+const CANCEL_ATTEMPT_LIMIT: u32 = 10;
 
 /// What the process is allowed to do with money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +115,15 @@ pub struct ExecutorConfig {
     pub gate_ttl: Duration,
     /// How long an unfilled entry order may rest before it is cancelled.
     pub order_ttl: Duration,
+    /// Breakout entries take liquidity instead of resting a maker bid: the very
+    /// move the signal describes is what leaves a passive bid behind.
+    pub breakout_taker: bool,
+    /// Ticks above the best bid a pullback entry rests at, so it joins the front
+    /// of the queue instead of the back.
+    pub maker_offset_ticks: u32,
+    /// Cancel a resting entry once the mark runs this many bps above its limit.
+    /// Non-positive disables the check.
+    pub entry_max_chase_bps: Decimal,
     pub slippage_bps: Decimal,
     pub fee_bps: Decimal,
     /// Fallback venue steps for symbols the scanner has no metadata for.
@@ -128,7 +146,10 @@ impl ExecutorConfig {
             trend_exit: env_bool("EXEC_TREND_EXIT", true),
             cooldown: env_duration("EXEC_COOLDOWN_SECS", 10)?,
             gate_ttl: env_duration("EXEC_GATE_TTL_SECS", 120)?,
-            order_ttl: env_duration("EXEC_ORDER_TTL_SECS", 12)?,
+            order_ttl: env_duration("EXEC_ORDER_TTL_SECS", 30)?,
+            breakout_taker: env_bool("EXEC_BREAKOUT_TAKER", true),
+            maker_offset_ticks: env_u32("EXEC_MAKER_OFFSET_TICKS", 1)?.min(10),
+            entry_max_chase_bps: env_decimal("EXEC_ENTRY_MAX_CHASE_BPS", "20")?,
             slippage_bps: env_decimal("EXEC_SLIPPAGE_BPS", "5")?,
             fee_bps: env_decimal("EXEC_FEE_BPS", "20")?,
             base_step: env_decimal("EXEC_BASE_STEP", "0.000001")?,
@@ -195,6 +216,11 @@ impl ExecutorConfig {
                 "EXEC_FEE_BPS and EXEC_SLIPPAGE_BPS must not be negative".into(),
             ));
         }
+        if self.entry_max_chase_bps < Decimal::ZERO {
+            return Err(ExecutionError::Config(
+                "EXEC_ENTRY_MAX_CHASE_BPS must not be negative (0 disables it)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -227,6 +253,13 @@ fn env_bool(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+fn env_u32(name: &str, default: u32) -> Result<u32, ExecutionError> {
+    let raw = env_string(name, &default.to_string());
+    raw.parse::<u32>().map_err(|error| {
+        ExecutionError::Config(format!("{name}={raw:?} is not a whole number: {error}"))
+    })
 }
 
 fn env_duration(name: &str, default_secs: u64) -> Result<Duration, ExecutionError> {
@@ -296,6 +329,33 @@ fn is_order_value_min_error(error: &ExecutionError) -> bool {
         }
         _ => false,
     }
+}
+
+/// `true` when HTX says the order does not exist. Such an order cannot be
+/// cancelled and cannot fill any more, so a cancel loop must end instead of
+/// retrying it forever.
+fn is_order_not_found(error: &ExecutionError) -> bool {
+    match error {
+        ExecutionError::Api { code, message } => {
+            let code = code.to_ascii_lowercase();
+            let message = message.to_ascii_lowercase();
+            code.contains("order-not-exist")
+                || code.contains("order-not-found")
+                || message.contains("order-not-exist")
+                || message.contains("order not exist")
+        }
+        _ => false,
+    }
+}
+
+/// Delay before the next cancel attempt: `CANCEL_BACKOFF_STEP` per failed
+/// attempt, capped at [`CANCEL_BACKOFF_MAX`]. Pure so the schedule is testable
+/// without a venue.
+fn cancel_backoff(attempts: u32) -> Duration {
+    CANCEL_BACKOFF_STEP
+        .checked_mul(attempts.max(1))
+        .unwrap_or(CANCEL_BACKOFF_MAX)
+        .min(CANCEL_BACKOFF_MAX)
 }
 
 /// One non-USDT balance found on the venue at startup.
@@ -516,6 +576,10 @@ struct TrackedOrder {
     /// `true` while the accepted entry is represented by a local pending
     /// position that has not been confirmed by a fill.
     pending_entry: bool,
+    /// Failed cancel attempts so far, driving the retry backoff and the halt.
+    cancel_attempts: u32,
+    /// Earliest instant the next cancel attempt may be sent.
+    next_cancel_at: Option<Instant>,
 }
 
 /// The state machine.
@@ -663,7 +727,7 @@ impl Executor {
     /// closes.
     pub async fn run(mut self, mut commands: mpsc::Receiver<ExecutionCommand>) {
         println!(
-            "[EXEC] mode={} pairs={} order_notional={}USDT trail={}xATR sl={}% trend_exit={} gate_ttl={}s",
+            "[EXEC] mode={} pairs={} order_notional={}USDT trail={}xATR sl={}% trend_exit={} gate_ttl={}s order_ttl={}s entries={}",
             self.broker.name(),
             self.board().pairs().len(),
             self.cfg.order_notional,
@@ -671,6 +735,12 @@ impl Executor {
             self.cfg.stop_loss_pct,
             self.cfg.trend_exit,
             self.cfg.gate_ttl.as_secs(),
+            self.cfg.order_ttl.as_secs(),
+            if self.cfg.breakout_taker {
+                "breakout:taker pullback:maker"
+            } else {
+                "breakout:maker pullback:maker"
+            },
         );
         if !self.broker.is_paper() {
             self.live_preflight().await;
@@ -847,14 +917,43 @@ impl Executor {
         }
 
         let (base_step, price_step) = self.steps_for(&symbol);
-        let Some(limit) = maker_price(signal.side, &snapshot, price_step) else {
+        // A breakout is momentum: by the time price clears the Donchian level the
+        // bid it would rest on is already behind the move, so those entries take
+        // liquidity. A pullback is bought *into* a dip, where resting just above
+        // the bid earns the spread instead of paying it.
+        let kind = match (signal.kind, self.cfg.breakout_taker) {
+            (EntryKind::Breakout, true) => OrderKind::Market,
+            _ => OrderKind::MakerLimit,
+        };
+        let limit = match kind {
+            OrderKind::Market => entry_price(signal.side, &snapshot).unwrap_or_default(),
+            OrderKind::MakerLimit => {
+                match maker_price(
+                    signal.side,
+                    &snapshot,
+                    price_step,
+                    self.cfg.maker_offset_ticks,
+                ) {
+                    Some(limit) => limit,
+                    None => {
+                        println!(
+                            "[EXEC] skip {} {}: no non-crossing top of book for a maker entry",
+                            symbol.to_uppercase(),
+                            signal.side.as_str()
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        if limit <= Decimal::ZERO {
             println!(
-                "[EXEC] skip {} {}: no non-crossing top of book for a maker entry",
+                "[EXEC] skip {} {}: no price to size the entry against",
                 symbol.to_uppercase(),
                 signal.side.as_str()
             );
             return;
-        };
+        }
         let target_notional = self.entry_notional(&symbol);
         // Size against the limit, not the touch: the fee must fit the balance
         // and a maker order must never spend more than the configured notional.
@@ -876,7 +975,7 @@ impl Executor {
             side: signal.side,
             amount,
             price: limit,
-            kind: OrderKind::MakerLimit,
+            kind,
             client_order_id: self.next_client_id(),
         };
 
@@ -916,11 +1015,13 @@ impl Executor {
         }
 
         println!(
-            "[EXEC] placing MAKER {} {} {} @ {} (signal: {})",
+            "[EXEC] placing {} {} {} {} @ {} (signal: {} {})",
+            kind.as_str(),
             signal.side.as_str(),
             amount,
             symbol.to_uppercase(),
             limit,
+            signal.kind.as_str(),
             signal.reason
         );
 
@@ -940,6 +1041,8 @@ impl Executor {
                     created_at: now,
                     applied_filled: Decimal::ZERO,
                     pending_entry: false,
+                    cancel_attempts: 0,
+                    next_cancel_at: None,
                 });
                 self.absorb_working().await;
             }
@@ -1098,8 +1201,10 @@ impl Executor {
     ///
     /// HTX reports cancelling an already-terminal order as an API error, so an
     /// error is not proof that the order is still resting. The status is
-    /// queried before deciding: a filled order is absorbed normally, and only
-    /// an order that is still live is kept tracked for a retry. Never fake a
+    /// queried before deciding: a filled order is absorbed normally, an order
+    /// the venue does not know about is treated as gone, and only an order that
+    /// is demonstrably still live stays tracked — with a growing backoff, so a
+    /// cancel that keeps failing cannot become a request loop. Never fake a
     /// cancellation: that would leave a real order (and its pending position)
     /// unmanaged.
     async fn cancel_and_absorb(&mut self, mut working: TrackedOrder, label: &str) -> bool {
@@ -1109,9 +1214,7 @@ impl Executor {
                     "[EXEC] {label}: cancelled order {}",
                     working.report.order_id
                 );
-                working.report.status = OrderStatus::Canceled;
-                self.working = Some(working);
-                self.absorb_working().await;
+                self.book_final_fill(working, label).await;
                 true
             }
             Err(error) => {
@@ -1119,6 +1222,7 @@ impl Executor {
                     "[EXEC] {label}: cancel failed for {}: {error}",
                     working.report.order_id
                 );
+                let vanished = is_order_not_found(&error);
                 match self.broker.status(&working.report).await {
                     Ok(update) if update.status.is_terminal() => {
                         working.report = update;
@@ -1133,21 +1237,116 @@ impl Executor {
                             update.status.as_str()
                         );
                         working.report = update;
+                        self.defer_cancel(&mut working, label);
                         self.working = Some(working);
                         self.absorb_working().await;
                         false
+                    }
+                    Err(status_error) if vanished && is_order_not_found(&status_error) => {
+                        // The venue knows neither how to cancel it nor how to
+                        // find it: the order is gone, so waiting longer can
+                        // only keep the local book hostage.
+                        eprintln!(
+                            "[EXEC] {label}: order {} is unknown to the venue ({status_error}); treating it as ended",
+                            working.report.order_id
+                        );
+                        working.report.status = OrderStatus::Canceled;
+                        self.working = Some(working);
+                        self.absorb_working().await;
+                        true
                     }
                     Err(status_error) => {
                         eprintln!(
                             "[EXEC] {label}: could not confirm {} after a failed cancel: {status_error}",
                             working.report.order_id
                         );
+                        self.defer_cancel(&mut working, label);
                         self.working = Some(working);
                         false
                     }
                 }
             }
         }
+    }
+
+    /// Retires a cancelled order after one last look at its fill.
+    ///
+    /// A cancel response says nothing about units that filled between the last
+    /// status poll and the cancel itself. One extra query makes the reported
+    /// fill authoritative instead of assumed; without it those units would sit
+    /// on the venue balance with no exit managing them.
+    async fn book_final_fill(&mut self, mut working: TrackedOrder, label: &str) {
+        working.report.status = OrderStatus::Canceled;
+        if !self.broker.is_paper() {
+            match self.broker.status(&working.report).await {
+                Ok(update) => {
+                    let reported = update.status;
+                    working.report = update;
+                    if !reported.is_terminal() {
+                        // The cancel was accepted; a state that has not advanced
+                        // yet must not keep the order tracked forever.
+                        working.report.status = OrderStatus::Canceled;
+                        eprintln!(
+                            "[EXEC] {label}: order {} was cancelled but the venue still reports {}; treating it as closed",
+                            working.report.order_id,
+                            reported.as_str()
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "[EXEC] {label}: final status for {} unavailable after the cancel: {error}",
+                    working.report.order_id
+                ),
+            }
+        }
+        self.working = Some(working);
+        self.absorb_working().await;
+    }
+
+    /// Schedules the next cancel attempt and halts entries once the venue keeps
+    /// refusing. An order that cannot be cancelled is unmanaged exposure and
+    /// has to be loud, not a silent retry loop.
+    fn defer_cancel(&mut self, working: &mut TrackedOrder, label: &str) {
+        working.cancel_attempts = working.cancel_attempts.saturating_add(1);
+        let backoff = cancel_backoff(working.cancel_attempts);
+        working.next_cancel_at = Some(Instant::now() + backoff);
+        eprintln!(
+            "[EXEC] {label}: cancel attempt {} for {} failed; retrying in {}s",
+            working.cancel_attempts,
+            working.report.order_id,
+            backoff.as_secs()
+        );
+        if working.cancel_attempts >= CANCEL_ATTEMPT_LIMIT {
+            let reason = format!(
+                "order {} cannot be cancelled after {} attempts",
+                working.report.order_id, working.cancel_attempts
+            );
+            eprintln!("[EXEC] {label}: HALTING entries — {reason}; cancel it by hand on HTX");
+            self.risk.halt(reason);
+        }
+    }
+
+    /// `true` when the market has run away from a resting entry.
+    ///
+    /// A post-only entry is a bet that price comes back to the order. Once the
+    /// mark is more than `entry_max_chase_bps` above the limit that bet is lost:
+    /// the order can only fill at a price the signal no longer describes, and
+    /// waiting out the TTL just delays the next signal.
+    fn entry_is_stale(&self, snapshot: &MarketSnapshot) -> bool {
+        if self.cfg.entry_max_chase_bps <= Decimal::ZERO {
+            return false;
+        }
+        let Some(working) = self.working.as_ref() else {
+            return false;
+        };
+        if working.purpose != Purpose::Entry
+            || working.request.side != Side::Buy
+            || working.request.kind != OrderKind::MakerLimit
+            || working.report.status.is_terminal()
+        {
+            return false;
+        }
+        entry_chase_bps(working, snapshot).is_some_and(|bps| bps > self.cfg.entry_max_chase_bps)
     }
 
     /// Raises the tracked peak with the executable exit mark.
@@ -1254,19 +1453,43 @@ impl Executor {
         self.refresh_peak(&snapshot);
 
         // A working order that never filled must not camp on the book forever —
-        // only entries still rest; exits are market orders now.
-        let expired = self.working.as_ref().is_some_and(|working| {
-            !working.report.status.is_terminal()
-                && working.created_at.elapsed() >= self.cfg.order_ttl
-        });
-        if expired {
+        // only entries still rest; exits are market orders now. A cancel that
+        // the venue refused is retried on a growing backoff instead of on every
+        // tick, and that backoff covers every reason to cancel: a stale entry
+        // must not hammer a venue that already refused the cancel.
+        let now = Instant::now();
+        let ready = self
+            .working
+            .as_ref()
+            .is_none_or(|working| working.next_cancel_at.is_none_or(|after| now >= after));
+        let stale = ready && self.entry_is_stale(&snapshot);
+        let expired = !stale
+            && ready
+            && self.working.as_ref().is_some_and(|working| {
+                !working.report.status.is_terminal()
+                    && working.created_at.elapsed() >= self.cfg.order_ttl
+            });
+        if stale || expired {
             if let Some(working) = self.working.take() {
-                println!(
-                    "[EXEC] cancelling order {} after {}s without a fill",
-                    working.report.order_id,
-                    self.cfg.order_ttl.as_secs()
-                );
-                self.cancel_and_absorb(working, "order expiry").await;
+                let label = if stale {
+                    let chase_bps = entry_chase_bps(&working, &snapshot).unwrap_or_default();
+                    println!(
+                        "[EXEC] entry invalidation: {} is {}bps above the resting limit {}; cancelling order {}",
+                        snapshot.symbol.to_uppercase(),
+                        chase_bps.round_dp(1),
+                        working.request.price,
+                        working.report.order_id
+                    );
+                    "entry invalidation"
+                } else {
+                    println!(
+                        "[EXEC] cancelling order {} after {}s without a fill",
+                        working.report.order_id,
+                        self.cfg.order_ttl.as_secs()
+                    );
+                    "order expiry"
+                };
+                self.cancel_and_absorb(working, label).await;
             }
         }
 
@@ -1438,6 +1661,8 @@ impl Executor {
                     created_at: now,
                     applied_filled: Decimal::ZERO,
                     pending_entry: false,
+                    cancel_attempts: 0,
+                    next_cancel_at: None,
                 });
                 self.absorb_working().await;
             }
@@ -1516,6 +1741,8 @@ impl Executor {
                             created_at: Instant::now(),
                             applied_filled: Decimal::ZERO,
                             pending_entry: false,
+                            cancel_attempts: 0,
+                            next_cancel_at: None,
                         });
                         self.absorb_working().await;
                     }
@@ -2027,37 +2254,58 @@ pub(crate) fn entry_price(side: Side, snapshot: &MarketSnapshot) -> Option<Decim
 
 /// A post-only limit price that joins the book instead of crossing it.
 ///
-/// Buys rest on the bid, sells on the ask. The price is rounded towards the
-/// passive side after a venue-step adjustment, so rounding can never turn the
-/// order into a taker.
+/// Buys rest on the bid, sells on the ask, moved `offset_ticks` venue steps
+/// towards the spread so the order sits in front of the queue instead of at its
+/// back. The offset is only applied while it keeps the order passive: on a
+/// one-tick spread it would cross, so the touch itself is used. Rounding is
+/// always towards the passive side, so it can never turn a maker into a taker.
 pub(crate) fn maker_price(
     side: Side,
     snapshot: &MarketSnapshot,
     price_step: Decimal,
+    offset_ticks: u32,
 ) -> Option<Decimal> {
-    let (raw, round_up) = match side {
+    let (touch, round_up) = match side {
         Side::Buy => (snapshot.best_bid?, false),
         Side::Sell => (snapshot.best_ask?, true),
     };
-    if raw <= Decimal::ZERO {
+    if touch <= Decimal::ZERO || price_step <= Decimal::ZERO {
         return None;
     }
-    let price = round_to_step(raw, price_step, round_up);
-    if price <= Decimal::ZERO {
-        return None;
-    }
-
+    let base = round_to_step(touch, price_step, round_up);
+    let offset = price_step * Decimal::from(offset_ticks);
+    let target = match side {
+        Side::Buy => base + offset,
+        Side::Sell => base - offset,
+    };
     // Belt and braces: never hand a crossing price to a post-only venue.
+    let price = if joins_the_book(side, target, snapshot) {
+        target
+    } else {
+        base
+    };
+    (price > Decimal::ZERO && joins_the_book(side, price, snapshot)).then_some(price)
+}
+
+/// `true` when `price` stays on the passive side of the touch.
+fn joins_the_book(side: Side, price: Decimal, snapshot: &MarketSnapshot) -> bool {
     match side {
-        Side::Buy => snapshot
-            .best_ask
-            .is_none_or(|ask| price < ask)
-            .then_some(price),
-        Side::Sell => snapshot
-            .best_bid
-            .is_none_or(|bid| price > bid)
-            .then_some(price),
+        Side::Buy => snapshot.best_ask.is_none_or(|ask| price < ask),
+        Side::Sell => snapshot.best_bid.is_none_or(|bid| price > bid),
     }
+}
+
+/// How far the mark has run above a resting entry's limit, in basis points.
+fn entry_chase_bps(working: &TrackedOrder, snapshot: &MarketSnapshot) -> Option<Decimal> {
+    let limit = working.request.price;
+    if limit <= Decimal::ZERO {
+        return None;
+    }
+    let mark = snapshot.mark_price()?;
+    if mark <= limit {
+        return Some(Decimal::ZERO);
+    }
+    Some((mark - limit) / limit * Decimal::from(10_000))
 }
 
 /// The price used to mark an exit for a position of `qty`.
@@ -2239,6 +2487,9 @@ mod tests {
             cooldown: Duration::ZERO,
             gate_ttl: Duration::from_secs(60),
             order_ttl: Duration::from_secs(5),
+            breakout_taker: true,
+            maker_offset_ticks: 1,
+            entry_max_chase_bps: dec("20"),
             slippage_bps: Decimal::ZERO,
             fee_bps: Decimal::ZERO,
             base_step: dec("0.000001"),
@@ -2305,6 +2556,8 @@ mod tests {
     }
 
     fn buy_signal(symbol: &str, price: &str) -> Signal {
+        // The default test signal is the maker path: most executor tests care
+        // about a resting entry, its pending overlay and its fill.
         Signal {
             symbol: symbol.into(),
             side: Side::Buy,
@@ -2312,8 +2565,42 @@ mod tests {
             adx: dec("28"),
             atr_pct: dec("0.4"),
             volume_spike: true,
-            kind: crate::strategy::EntryKind::Breakout,
+            kind: EntryKind::Pullback,
+            reason: "test pullback".into(),
+        }
+    }
+
+    fn breakout_signal(symbol: &str, price: &str) -> Signal {
+        Signal {
+            kind: EntryKind::Breakout,
             reason: "test breakout".into(),
+            ..buy_signal(symbol, price)
+        }
+    }
+
+    fn tracked_entry() -> TrackedOrder {
+        TrackedOrder {
+            request: OrderRequest {
+                symbol: "btcusdt".into(),
+                side: Side::Buy,
+                amount: dec("0.001"),
+                price: dec("65000"),
+                kind: OrderKind::MakerLimit,
+                client_order_id: "test".into(),
+            },
+            report: OrderReport {
+                order_id: "1".into(),
+                client_order_id: "test".into(),
+                status: OrderStatus::Submitted,
+                filled_amount: Decimal::ZERO,
+                filled_cash: Decimal::ZERO,
+            },
+            purpose: Purpose::Entry,
+            created_at: Instant::now(),
+            applied_filled: Decimal::ZERO,
+            pending_entry: false,
+            cancel_attempts: 0,
+            next_cancel_at: None,
         }
     }
 
@@ -2792,17 +3079,18 @@ mod tests {
             .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
             .await;
 
-        // The post-only buy rests on the bid, but the local portfolio already
-        // knows about it: no flat window between acceptance and fill.
+        // The post-only buy rests one tick above the bid, but the local
+        // portfolio already knows about it: no flat window between acceptance
+        // and fill.
         let working = executor.working.as_ref().expect("maker order must rest");
         assert_eq!(working.request.kind, OrderKind::MakerLimit);
-        assert_eq!(working.request.price, dec("65000"));
+        assert_eq!(working.request.price, dec("65000.01"));
         assert!(working.pending_entry);
         assert_eq!(executor.portfolio.position.qty(), dec("0.001538"));
-        assert_eq!(executor.portfolio.position.avg_entry(), dec("65000"));
+        assert_eq!(executor.portfolio.position.avg_entry(), dec("65000.01"));
         assert_eq!(
             executor.portfolio.cash,
-            dec("9900.03"),
+            dec("9900.02998462"),
             "paper cash is reserved for the resting entry"
         );
 
@@ -3016,7 +3304,7 @@ mod tests {
             .await;
 
         assert_eq!(executor.portfolio.position.qty(), dec("0.001538"));
-        assert_eq!(executor.portfolio.cash, dec("9900.03"));
+        assert_eq!(executor.portfolio.cash, dec("9900.02998462"));
         let working = executor.working.as_mut().expect("order must be resting");
         working.created_at = Instant::now() - config().order_ttl - Duration::from_secs(1);
 
@@ -3240,5 +3528,195 @@ mod tests {
         assert!(executor.portfolio.position.is_flat());
         assert!(executor.risk.is_halted());
         assert!(executor.open_symbol.is_none());
+    }
+
+    #[test]
+    fn maker_prices_jump_the_queue_without_crossing() {
+        let book = MarketSnapshot {
+            symbol: "trumpusdt".into(),
+            best_bid: Some(dec("0.9442")),
+            best_ask: Some(dec("0.9457")),
+            last_price: Some(dec("0.9442")),
+            ..MarketSnapshot::default()
+        };
+        // One tick above the bid: in front of the queue, still passive.
+        assert_eq!(
+            maker_price(Side::Buy, &book, dec("0.0001"), 1),
+            Some(dec("0.9443"))
+        );
+        // Zero offset keeps the old behaviour: the bid itself.
+        assert_eq!(
+            maker_price(Side::Buy, &book, dec("0.0001"), 0),
+            Some(dec("0.9442"))
+        );
+
+        // A one-tick spread cannot be jumped without crossing, so the touch is
+        // used instead of handing a taker price to a post-only venue.
+        let tight = MarketSnapshot {
+            symbol: "btcusdt".into(),
+            best_bid: Some(dec("65000")),
+            best_ask: Some(dec("65000.01")),
+            last_price: Some(dec("65000.005")),
+            ..MarketSnapshot::default()
+        };
+        assert_eq!(
+            maker_price(Side::Buy, &tight, dec("0.01"), 2),
+            Some(dec("65000"))
+        );
+    }
+
+    #[test]
+    fn cancel_backoff_grows_and_is_capped() {
+        assert_eq!(cancel_backoff(1), Duration::from_secs(5));
+        assert_eq!(cancel_backoff(3), Duration::from_secs(15));
+        assert_eq!(cancel_backoff(12), CANCEL_BACKOFF_MAX);
+        assert_eq!(cancel_backoff(u32::MAX), CANCEL_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn a_vanished_order_is_recognized() {
+        assert!(is_order_not_found(&ExecutionError::Api {
+            code: "order-order-not-exist".into(),
+            message: "order not exist".into(),
+        }));
+        assert!(is_order_not_found(&ExecutionError::Api {
+            code: "invalid-argument".into(),
+            message: "order-not-exist".into(),
+        }));
+        assert!(!is_order_not_found(&ExecutionError::Api {
+            code: "invalid-signature".into(),
+            message: "bad signature".into(),
+        }));
+        assert!(!is_order_not_found(&ExecutionError::Http(
+            "connection reset".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn repeated_cancel_failures_halt_entries() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board);
+        let mut working = tracked_entry();
+
+        for attempt in 1..CANCEL_ATTEMPT_LIMIT {
+            executor.defer_cancel(&mut working, "test");
+            assert_eq!(working.cancel_attempts, attempt);
+            assert!(!executor.risk.is_halted(), "halt only at the limit");
+            let wait = working
+                .next_cancel_at
+                .expect("a retry must be scheduled")
+                .duration_since(Instant::now());
+            assert!(wait <= CANCEL_BACKOFF_MAX);
+        }
+
+        // The last allowed attempt hands the order to an operator instead of
+        // hammering the venue forever.
+        executor.defer_cancel(&mut working, "test");
+        assert_eq!(working.cancel_attempts, CANCEL_ATTEMPT_LIMIT);
+        assert!(executor.risk.is_halted());
+        assert!(executor
+            .risk
+            .halt_reason()
+            .is_some_and(|reason| reason.contains("cannot be cancelled")));
+    }
+
+    #[tokio::test]
+    async fn breakout_entries_take_the_ask_instead_of_resting() {
+        let board = board_with(&[("trumpusdt", "1", "0.0001")]);
+        publish(&board, "trumpusdt", "0.9442", "0.9457", "0.9442");
+        let mut executor = executor(config(), board);
+
+        executor.handle_command(verdict(&["trumpusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(breakout_signal(
+                "trumpusdt",
+                "0.9457",
+            )))
+            .await;
+
+        // A breakout is momentum: the entry crosses the spread instead of
+        // lingering under a move that may never come back.
+        assert!(executor.working.is_none(), "market entry must fill at once");
+        assert_eq!(executor.portfolio.position.qty(), dec("105"));
+        assert_eq!(executor.portfolio.position.avg_entry(), dec("0.9457"));
+        assert_eq!(executor.open_symbol.as_deref(), Some("trumpusdt"));
+    }
+
+    #[tokio::test]
+    async fn pullback_entries_rest_one_tick_above_the_bid() {
+        let board = board_with(&[("trumpusdt", "1", "0.0001")]);
+        publish(&board, "trumpusdt", "0.9442", "0.9457", "0.9442");
+        let mut executor = executor(config(), board);
+
+        executor.handle_command(verdict(&["trumpusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("trumpusdt", "0.9442")))
+            .await;
+
+        let working = executor.working.as_ref().expect("maker order must rest");
+        assert_eq!(working.request.kind, OrderKind::MakerLimit);
+        assert_eq!(
+            working.request.price,
+            dec("0.9443"),
+            "a pullback joins the front of the bid queue"
+        );
+        assert!(working.pending_entry);
+    }
+
+    #[tokio::test]
+    async fn a_pending_cancel_backoff_suppresses_the_next_attempt() {
+        let board = board_with(&[("trumpusdt", "1", "0.0001")]);
+        publish(&board, "trumpusdt", "0.9442", "0.9457", "0.9442");
+        let mut executor = executor(config(), board.clone());
+
+        executor.handle_command(verdict(&["trumpusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("trumpusdt", "0.9442")))
+            .await;
+
+        // A cancel already failed, so the next attempt is 5s away.
+        let mut working = executor.working.take().expect("order must be resting");
+        executor.defer_cancel(&mut working, "test");
+        let attempts = working.cancel_attempts;
+        executor.working = Some(working);
+
+        // The market runs above the limit: the entry is stale on every tick, but
+        // the pending backoff keeps the executor from hammering the venue.
+        publish(&board, "trumpusdt", "0.9465", "0.9466", "0.9465");
+        executor.on_tick().await;
+
+        let working = executor
+            .working
+            .as_ref()
+            .expect("the backoff must delay the next cancel");
+        assert_eq!(working.cancel_attempts, attempts);
+        assert!(working
+            .next_cancel_at
+            .is_some_and(|after| after > Instant::now()));
+        assert!(!executor.portfolio.position.is_flat());
+    }
+
+    #[tokio::test]
+    async fn a_resting_entry_is_cancelled_when_the_market_runs_away() {
+        let board = board_with(&[("trumpusdt", "1", "0.0001")]);
+        publish(&board, "trumpusdt", "0.9442", "0.9457", "0.9442");
+        let mut executor = executor(config(), board.clone());
+
+        executor.handle_command(verdict(&["trumpusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("trumpusdt", "0.9442")))
+            .await;
+        assert_eq!(executor.portfolio.position.qty(), dec("105"));
+
+        // +23 bps above the resting limit: the signal no longer describes the
+        // price, so the order is cancelled instead of waiting out its TTL.
+        publish(&board, "trumpusdt", "0.9465", "0.9466", "0.9465");
+        executor.on_tick().await;
+
+        assert!(executor.working.is_none(), "stale entry must be cancelled");
+        assert!(executor.portfolio.position.is_flat());
+        assert_eq!(executor.portfolio.cash, dec("10000"));
+        assert_eq!(executor.open_symbol, None);
     }
 }
