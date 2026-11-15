@@ -24,6 +24,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DEFAULT_INTERVAL_SECS: u64 = 90;
 const DEFAULT_MIN_QUOTE_VOLUME: &str = "1000000";
+/// Hard default: a scalp with a wider touch cannot survive 2 x taker fees plus
+/// adverse selection, so pairs above 40 bps are never shown to the AI.
+const DEFAULT_MAX_SPREAD_BPS: &str = "40";
 const DEFAULT_TOP_N: usize = 12;
 const MAX_TOP_N: usize = 50;
 const QUOTE: &str = "usdt";
@@ -77,7 +80,7 @@ impl ScannerConfig {
                 "SCAN_MIN_QUOTE_VOLUME_USDT must not be negative".into(),
             ));
         }
-        let max_spread_bps = env_decimal("SCAN_MAX_SPREAD_BPS", "150")?;
+        let max_spread_bps = env_decimal("SCAN_MAX_SPREAD_BPS", DEFAULT_MAX_SPREAD_BPS)?;
         if max_spread_bps < Decimal::ZERO {
             return Err(ScannerError::Config(
                 "SCAN_MAX_SPREAD_BPS must not be negative (0 disables the filter)".into(),
@@ -606,7 +609,7 @@ mod tests {
         ScannerConfig {
             interval: Duration::from_secs(90),
             min_quote_volume: dec("1000000"),
-            max_spread_bps: dec("150"),
+            max_spread_bps: dec(DEFAULT_MAX_SPREAD_BPS),
             top_n: 3,
             pinned: Vec::new(),
             rest_url: DEFAULT_REST_URL.into(),
@@ -658,6 +661,28 @@ mod tests {
         assert!(
             !symbols.contains(&"wideusdt"),
             "a 20% quoted spread is not tradable"
+        );
+    }
+
+    #[test]
+    fn forty_bps_is_the_default_spread_ceiling() {
+        let value = json!({
+            "data": [
+                { "symbol": "tightusdt", "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "vol": 5000000.0, "bid": 1.0, "ask": 1.0041 },
+                { "symbol": "tradesusdt", "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "vol": 5000000.0, "bid": 1.0, "ask": 1.0039 }
+            ]
+        });
+        let tickers = parse_tickers(&value).expect("board must parse");
+        let pairs = rank_pairs(&tickers, &HashMap::new(), &config());
+        let symbols: Vec<&str> = pairs.iter().map(|pair| pair.symbol.as_str()).collect();
+
+        assert!(
+            !symbols.contains(&"tightusdt"),
+            "41 bps must be dropped by the default 40 bps ceiling"
+        );
+        assert!(
+            symbols.contains(&"tradesusdt"),
+            "39 bps is still inside the ceiling"
         );
     }
 

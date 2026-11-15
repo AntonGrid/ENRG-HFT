@@ -25,7 +25,7 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 
 use crate::execution::signing::{self, SIGNATURE_METHOD, SIGNATURE_VERSION};
-use crate::execution::{ExecutionError, OrderReport, OrderRequest, OrderStatus};
+use crate::execution::{ExecutionError, OrderKind, OrderReport, OrderRequest, OrderStatus};
 
 pub const DEFAULT_REST_URL: &str = "https://api.htx.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -282,10 +282,17 @@ fn order_params(request: &OrderRequest, account_id: i64) -> BTreeMap<String, Str
     params.insert("account-id".into(), account_id.to_string());
     params.insert("amount".into(), decimal_param(request.amount));
     params.insert("client-order-id".into(), request.client_order_id.clone());
-    params.insert("price".into(), decimal_param(request.price));
+    // HTX rejects `price` on market orders; a maker order must carry the
+    // non-crossing limit price it was sized against.
+    if request.kind != OrderKind::Market {
+        params.insert("price".into(), decimal_param(request.price));
+    }
     params.insert("source".into(), "api".into());
     params.insert("symbol".into(), request.symbol.to_ascii_lowercase());
-    params.insert("type".into(), request.side.htx_order_type().into());
+    params.insert(
+        "type".into(),
+        request.kind.htx_order_type(request.side).into(),
+    );
     params
 }
 
@@ -445,17 +452,35 @@ mod tests {
             side: crate::execution::Side::Buy,
             amount: dec("0.000380"),
             price: dec("65000.10"),
+            kind: OrderKind::MakerLimit,
             client_order_id: "enrg-42".into(),
         };
 
         let params = order_params(&request, 12345678);
         assert_eq!(params.get("account-id").unwrap(), "12345678");
         assert_eq!(params.get("symbol").unwrap(), "btcusdt");
-        assert_eq!(params.get("type").unwrap(), "buy-limit");
+        assert_eq!(params.get("type").unwrap(), "buy-limit-maker");
         assert_eq!(params.get("amount").unwrap(), "0.00038");
         assert_eq!(params.get("price").unwrap(), "65000.1");
         assert_eq!(params.get("source").unwrap(), "api");
         assert_eq!(params.get("client-order-id").unwrap(), "enrg-42");
+    }
+
+    #[test]
+    fn market_orders_omit_the_limit_price() {
+        let request = OrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: crate::execution::Side::Sell,
+            amount: dec("0.01"),
+            price: dec("65000.10"),
+            kind: OrderKind::Market,
+            client_order_id: "enrg-43".into(),
+        };
+
+        let params = order_params(&request, 12345678);
+        assert_eq!(params.get("type").unwrap(), "sell-market");
+        assert_eq!(params.get("amount").unwrap(), "0.01");
+        assert!(!params.contains_key("price"));
     }
 
     #[test]
@@ -466,6 +491,7 @@ mod tests {
             side: crate::execution::Side::Buy,
             amount: dec("1.25"),
             price: dec("18.47"),
+            kind: OrderKind::MakerLimit,
             client_order_id: "enrg-77".into(),
         };
         let params = order_params(&request, 12345678);

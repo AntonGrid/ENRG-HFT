@@ -14,7 +14,7 @@
 use rust_decimal::Decimal;
 
 use crate::execution::htx_rest::{Balance, HtxRest};
-use crate::execution::{ExecutionError, OrderReport, OrderRequest, OrderStatus, Side};
+use crate::execution::{ExecutionError, OrderKind, OrderReport, OrderRequest, OrderStatus, Side};
 use crate::strategy::MarketSnapshot;
 
 /// The paper venue.
@@ -40,7 +40,8 @@ impl PaperBroker {
         self.resting.len()
     }
 
-    /// Places an order. Marketable limits fill at the touch; the rest rest.
+    /// Places an order. Market orders fill at the touch; a maker limit that
+    /// would cross is rejected, exactly like a post-only venue.
     pub fn place(
         &mut self,
         request: &OrderRequest,
@@ -70,11 +71,27 @@ impl PaperBroker {
             filled_cash: Decimal::ZERO,
         };
 
-        if let Some(price) = crossing_price(request, market) {
-            report.status = OrderStatus::Filled;
-            report.filled_amount = request.amount;
-            report.filled_cash = price * request.amount;
-            return Ok(report);
+        match request.kind {
+            OrderKind::Market => {
+                let price = market_touch(request.side, market).ok_or_else(|| {
+                    ExecutionError::Protocol(
+                        "paper broker: no touch to fill a market order against".into(),
+                    )
+                })?;
+                report.status = OrderStatus::Filled;
+                report.filled_amount = request.amount;
+                report.filled_cash = price * request.amount;
+                return Ok(report);
+            }
+            OrderKind::MakerLimit => {
+                if crossing_price(request, market).is_some() {
+                    return Err(ExecutionError::Protocol(format!(
+                        "paper broker: post-only {} order at {} would cross the book",
+                        request.side.as_str(),
+                        request.price
+                    )));
+                }
+            }
         }
 
         self.resting.push(RestingOrder {
@@ -219,7 +236,16 @@ impl Broker {
     }
 }
 
-/// The price at which a paper order would execute right now, if any.
+/// The price at which a market order would execute right now.
+fn market_touch(side: Side, market: &MarketSnapshot) -> Option<Decimal> {
+    let touch = match side {
+        Side::Buy => market.best_ask.or(market.last_price),
+        Side::Sell => market.best_bid.or(market.last_price),
+    };
+    touch.filter(|price| *price > Decimal::ZERO)
+}
+
+/// The price at which a paper limit order would execute right now, if any.
 fn crossing_price(request: &OrderRequest, market: &MarketSnapshot) -> Option<Decimal> {
     match request.side {
         Side::Buy => market.best_ask.filter(|ask| request.price >= *ask),
@@ -252,16 +278,24 @@ mod tests {
             side,
             amount: dec(amount),
             price: dec(price),
+            kind: OrderKind::MakerLimit,
             client_order_id: "test".into(),
         }
     }
 
+    fn market_request(side: Side, amount: &str, price: &str) -> OrderRequest {
+        OrderRequest {
+            kind: OrderKind::Market,
+            ..request(side, amount, price)
+        }
+    }
+
     #[test]
-    fn marketable_buy_fills_at_the_ask() {
+    fn market_buy_fills_at_the_ask() {
         let mut paper = PaperBroker::new();
         let report = paper
             .place(
-                &request(Side::Buy, "0.001", "65001"),
+                &market_request(Side::Buy, "0.001", "65001"),
                 &market("65000", "65001"),
             )
             .expect("order must be accepted");
@@ -270,6 +304,18 @@ mod tests {
         assert_eq!(report.filled_amount, dec("0.001"));
         assert_eq!(report.filled_cash, dec("65.001"));
         assert_eq!(report.avg_price(), Some(dec("65001")));
+        assert_eq!(paper.open_orders(), 0);
+    }
+
+    #[test]
+    fn post_only_buy_at_the_ask_is_rejected() {
+        let mut paper = PaperBroker::new();
+        assert!(paper
+            .place(
+                &request(Side::Buy, "0.001", "65001"),
+                &market("65000", "65001")
+            )
+            .is_err());
         assert_eq!(paper.open_orders(), 0);
     }
 
@@ -298,11 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn marketable_sell_fills_at_the_bid() {
+    fn market_sell_fills_at_the_bid() {
         let mut paper = PaperBroker::new();
         let report = paper
             .place(
-                &request(Side::Sell, "0.002", "64999"),
+                &market_request(Side::Sell, "0.002", "64999"),
                 &market("65000", "65001"),
             )
             .expect("order must be accepted");

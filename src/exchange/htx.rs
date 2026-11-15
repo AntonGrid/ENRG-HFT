@@ -112,6 +112,8 @@ pub enum MarketEvent {
     Trade {
         symbol: String,
         price: Decimal,
+        /// Base-asset size of the print, used by the volume-spike filter.
+        amount: Decimal,
         exchange_ts_ms: i64,
         received_ns: u128,
     },
@@ -478,6 +480,10 @@ fn handle_trades(
         let Some(price) = trade.get("price").and_then(decimal_from_value) else {
             continue;
         };
+        let amount = trade
+            .get("amount")
+            .and_then(decimal_from_value)
+            .unwrap_or(Decimal::ZERO);
         let exchange_ts_ms = trade
             .get("ts")
             .and_then(Value::as_i64)
@@ -503,6 +509,7 @@ fn handle_trades(
         let _ = tx.try_send(MarketEvent::Trade {
             symbol: symbol.to_string(),
             price,
+            amount,
             exchange_ts_ms,
             received_ns,
         });
@@ -650,11 +657,13 @@ mod tests {
             MarketEvent::Trade {
                 symbol,
                 price,
+                amount,
                 exchange_ts_ms,
                 ..
             } => {
                 assert_eq!(symbol, "btcusdt");
                 assert_eq!(price, Decimal::from_str("96553.12").unwrap());
+                assert_eq!(amount, Decimal::from_str("0.001").unwrap());
                 assert_eq!(exchange_ts_ms, 1_763_112_345_600);
             }
             other => panic!("expected trade, got {other:?}"),

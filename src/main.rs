@@ -365,11 +365,12 @@ fn log_watchlist_changes(before: &[String], after: &[String]) {
 
 fn log_signal(signal: &Signal) {
     println!(
-        "[SIGNAL] {} {} {} ({}%) — {}",
+        "[SIGNAL] {} {} {} ({}%) volume_spike={} — {}",
         signal.symbol.to_uppercase(),
         signal.side.as_str(),
         signal.price,
         signal.move_pct,
+        if signal.volume_spike { "yes" } else { "no" },
         signal.reason
     );
 }

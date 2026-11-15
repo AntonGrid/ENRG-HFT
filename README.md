@@ -7,7 +7,7 @@ Hybrid **multi-pair** scalping bot — six layers, one binary.
 | 0.5 Scanner | `src/scanner.rs` | Every `SCAN_INTERVAL_SECS` pulls `GET /market/tickers`, keeps liquid USDT spot pairs (24h quote volume ≥ `SCAN_MIN_QUOTE_VOLUME_USDT`), drops stablecoins and leveraged tokens, ranks the rest by 24h amplitude and reads per-pair `amount-precision` / `price-precision` from `/v1/common/symbols`. |
 | 1. Fast hands | `src/exchange/htx.rs` | One HTX WebSocket (`wss://api.htx.com/ws`, fallback `wss://api.huobi.pro/ws`) for **all** scanned pairs: IPv4-only dial, gzip decoding, heartbeat, live `sub`/`unsub` as the watchlist rotates, per-symbol throttled logs, 15s stall watchdog and automatic reconnect. |
 | 2. Mathematics | `src/quant_core.rs` | Exact `Decimal` anomaly detection: more than 1% price move inside the last 10 ticks. |
-| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, **long-only** `Signal { symbol, side: BUY, price, … }` on a >1% dip (pumps are ignored), and the multi-pair context read by DeepSeek and the executor. |
+| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, **long-only** `Signal { symbol, side: BUY, price, volume_spike, … }` on a >1% dip (pumps are ignored), a rolling 1-minute quote-volume versus 24h-average filter, and the multi-pair context read by DeepSeek and the executor. |
 | 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager with a strict `{"action":"TRADE"\|"PAUSE","symbols":["…"],"reason":"…"}` contract, polled every `AI_INTERVAL_SECS`. |
 | 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders **on any pair the AI cleared**. |
 
@@ -17,11 +17,13 @@ on any of those symbols decides *when* to buy. The strategy is **long-only**:
 a >1% drop inside the anomaly window emits `BUY` (buying the rebound), while a
 >1% pump emits nothing — buying the top of a move is not a spot entry. A `SELL`
 is never an entry signal: the executor only sells the position it already holds
-(take-profit, stop-loss, timeout or kill switch). A stale verdict, a `PAUSE`, a
-symbol outside the scanner watchlist or a missing DeepSeek key keeps entries
-disabled while the bot keeps streaming data. Pair names are normalised
-(`LISTA-USDT` → `listausdt`); a bare base ticker such as `XMR` is accepted only
-when `XMRUSDT` is on the watchlist.
+(take-profit, stop-loss, timeout or kill switch). A dip is only tradable when
+its last minute carries at least **2×** the normal one-minute volume (the larger
+of the previous minute and the 24h average), so a quiet drift down is ignored.
+A stale verdict, a `PAUSE`, a symbol outside the scanner watchlist or a missing
+DeepSeek key keeps entries disabled while the bot keeps streaming data. Pair
+names are normalised (`LISTA-USDT` → `listausdt`); a bare base ticker such as
+`XMR` is accepted only when `XMRUSDT` is on the watchlist.
 
 ## Market scanner
 
@@ -38,7 +40,7 @@ There is no default `btcusdt`. The scanner ranks the whole HTX spot board by
 Filters: non-USDT markets, stablecoin bases (`usdc`, `dai`, `usdd`, …),
 leveraged tokens (`*3l`, `*3s`, `*5l`, `*5s`, …), anything below the volume
 floor and anything whose quoted spread is wider than `SCAN_MAX_SPREAD_BPS`
-(150 bps by default) are discarded. `SCAN_SYMBOLS` can pin extra pairs
+(40 bps by default) are discarded. `SCAN_SYMBOLS` can pin extra pairs
 (comma-separated), which bypass the volume and spread filters — handy for
 debugging one market.
 
@@ -64,30 +66,39 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
                               Portfolio/PnL ──> TP / SL / timeout ──> exit order
 ```
 
-- **Paper mode** (default) fills marketable limits at the live touch and rests
-  passive ones until the market trades through them. Fees are charged on both
-  sides, so paper PnL is honest about spread and commissions.
+- **Paper mode** (default) fills market orders at the live touch, rejects a
+  post-only limit that would cross, and rests passive limits until the market
+  trades through them. Fees are charged on both sides, so paper PnL is honest
+  about spread and commissions.
 - **Live mode** signs every request with HMAC-SHA256 (`StringToSign =
   METHOD\nhost\npath\nsorted-params`), sends POST parameters as an
-  `application/json` body (only auth fields are signed), prices limit orders
-  through the touch with `EXEC_SLIPPAGE_BPS`, polls order state once a second,
-  cancels unfilled entries after `EXEC_ORDER_TTL_SECS`, and logs every non-zero
-  account balance at boot. The live USDT balance is mirrored into the AI
-  context (`equity`/`cash`) every 30 seconds and right after each fill; an entry
-  is capped to the spendable balance so a small account is not rejected by the
-  venue.
+  `application/json` body (only auth fields are signed), polls order state once
+  a second, and logs every non-zero account balance at boot.
+  Entries and take-profit/timeout exits use `*-limit-maker` (post-only): a buy
+  rests on the best bid and a sell on the best ask, so neither pays taker fees
+  or crosses the spread. Stop-loss, the kill switch and startup liquidation use
+  `*-market` orders, because getting out matters more than the fee. An accepted
+  maker entry immediately appears in the local `Portfolio` (`position_qty` / `avg_entry`,
+  with paper cash reserved), so the AI context and risk guard never see a flat
+  book while the order is still resting; a cancel or reject rolls the overlay
+  back exactly. Unfilled maker orders are cancelled after
+  `EXEC_ORDER_TTL_SECS`. A resting take-profit is cancelled early if the book
+  reverses through the stop, so the market stop is never delayed by a maker.
+  The live USDT balance is mirrored into the AI context (`equity`/`cash`) every
+  30 seconds and right after each fill; an entry is capped to the spendable
+  balance so a small account is not rejected by the venue.
 - **Startup recovery** audits the full balance list before the first signal.
   The largest non-USDT coin with a tradable USDT market is restored as the open
   position at the restart mark, pinned into the websocket feed and protected by
   the normal TP/SL/timeout exits. Every other non-USDT balance (stablecoins,
-  leveraged tokens, unrelated coins) is sold into USDT with an aggressive
-  limit. Balances worth less than HTX's 1 USDT minimum order are logged as
+  leveraged tokens, unrelated coins) is sold into USDT with a **market** order.
+  Balances worth less than HTX's 1 USDT minimum order are logged as
   `ignoring dust` and left untouched: they can never be sold. A balance with no
   USDT market is logged and left untouched because it cannot be priced or sold.
   The original cost basis is not persisted by HTX, so a recovered position is
   anchored to the current mark.
 - **Ctrl-C** is a kill switch: the guard latches, working orders are cancelled,
-  the position is flattened with one aggressive order and a final report is
+  the position is flattened with one **market** order and a final report is
   printed.
 
 
@@ -107,6 +118,7 @@ short the venue would refuse. One position at a time across all pairs.
 | `EXEC_STOP_LOSS_PCT` | 0.5 | Close at -0.5% |
 | `EXEC_MAX_HOLD_SECS` | 120 | Time-based exit |
 | `EXEC_COOLDOWN_SECS` | 10 | Pause between accepted entries |
+| `EXEC_ORDER_TTL_SECS` | 12 | Cancel an unfilled maker entry/exit after this many seconds |
 
 Exits bypass the daily-loss halt and the cooldown, so an open position can
 always be closed.
@@ -126,7 +138,7 @@ silently downgrades to paper. Market selection is fully automatic:
 ```dotenv
 SCAN_INTERVAL_SECS=90
 SCAN_MIN_QUOTE_VOLUME_USDT=1000000
-SCAN_MAX_SPREAD_BPS=150
+SCAN_MAX_SPREAD_BPS=40
 SCAN_TOP_N=12
 # SCAN_SYMBOLS=btcusdt     # optional extra pins
 ```
@@ -161,18 +173,19 @@ Expected console output (paper mode, abridged):
 [DEPTH] FUNUSDT bid=0.001997 ask=0.002003
 [AI] 2026-11-14 16:27:00 UTC asking DeepSeek about 12 pairs:
 watchlist:
-1. LISTAUSDT last=0.1302 bid=0.1301 ask=0.1302 spread=7.7bps chg24=30% amp24=40% vol24=4200000 anomaly=yes
+1. LISTAUSDT last=0.1302 bid=0.1301 ask=0.1302 spread=7.7bps chg24=30% amp24=40% vol24=4200000 vol1m=6120 volume_spike: yes anomaly=yes
 ...
 account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 [AI] 2026-11-14 16:27:02 UTC decision: TRADE [LISTAUSDT, FUNUSDT, TRUMPUSDT] — momentum across the watchlist
 [EXEC] AI gate TRADE 3 pairs: LISTAUSDT, FUNUSDT, TRUMPUSDT — momentum across the watchlist
-[SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) — >1% dip across 10 ticks (buying the rebound)
-[EXEC] placing BUY 191.7 LISTAUSDT @ 0.1305 (signal: >1% dip across 10 ticks (buying the rebound))
-[EXEC] order paper-1 accepted: filled
-[EXEC] entry fill 191.7 LISTAUSDT @ 0.1305 (fee 0.0500)
-[EXEC] closing position: SELL 191.7 LISTAUSDT @ 0.1316 — take-profit (pnl 0.84%)
-[EXEC] exit fill 191.7 LISTAUSDT @ 0.1316 (fee 0.0504)
-[EXEC] trade #1 closed: net 0.1105 USDT (1 of 1 winners)
+[SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) volume_spike=yes — >1% dip across 10 ticks with 1m volume 6120 USDT (spike; baseline 2916)
+[EXEC] placing MAKER BUY 191.7 LISTAUSDT @ 0.1301 (signal: >1% dip across 10 ticks with 1m volume 6120 USDT (spike; baseline 2916))
+[EXEC] order paper-1 accepted: submitted
+[EXEC] portfolio pending BUY 191.7 LISTAUSDT @ 0.1301 (order paper-1)
+[EXEC] entry fill 191.7 LISTAUSDT @ 0.1301 (fee 0.0499)
+[EXEC] placing MAKER SELL 191.7 LISTAUSDT @ 0.1315 — take-profit (pnl 1.0%)
+[EXEC] exit fill 191.7 LISTAUSDT @ 0.1315 (fee 0.0504)
+[EXEC] trade #1 closed: net 0.1127 USDT (1 of 1 winners)
 ```
 
 ## Safety notes
@@ -182,8 +195,11 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
   scanner watchlist; a hallucinated ticker is rejected and logged.
 - Order amounts are rounded **down** to the pair's base step, never above the
   configured notional.
-- Prices are rounded **outward** to the pair's price step, so an "aggressive"
-  limit actually crosses the touch.
+- Reference prices for market orders are rounded **outward** to the pair's
+  price step, never back inside the touch; maker prices are rounded **towards
+  the passive side** and never cross.
+- A dip without a volume spike is ignored: the strategy needs at least 2× the
+  normal one-minute flow, not just a quiet price drift.
 - A missing or failing DeepSeek key leaves the gate closed: no entries, but the
   market feed, risk guard and positions remain live.
 - An exit rejected with HTX `order-value-min-error` is logged once and the
@@ -199,8 +215,9 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-119 unit tests, no network required: Decimal anomaly windows, scanner filtering
-and ranking, per-symbol books and watchlist pinning, DeepSeek JSON
+128 unit tests, no network required: Decimal anomaly windows, volume-spike
+gating, scanner filtering and ranking, per-symbol books and watchlist pinning,
+DeepSeek JSON
 normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
 request signing against an independent golden vector, order/balance parsers,
 portfolio PnL, every risk rejection, the paper broker's fill semantics and

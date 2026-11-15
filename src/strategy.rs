@@ -30,6 +30,20 @@ use crate::scanner::PairInfo;
 /// Minimum time between two anomaly signals on the same symbol.
 pub const ANOMALY_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// How much trade history the volume filter keeps.
+const VOLUME_WINDOW_NS: u128 = 120_000_000_000;
+/// The "recent" arm of the volume comparison.
+const VOLUME_RECENT_NS: u128 = 60_000_000_000;
+/// A dip is only tradable when the last minute carries at least this multiple
+/// of the normal one-minute flow.
+const VOLUME_SPIKE_MULTIPLIER: Decimal = Decimal::TWO;
+/// Upper bound on retained prints per symbol; deep enough for a very busy
+/// minute, small enough that a forgotten book cannot grow without limit.
+const VOLUME_SAMPLES_CAP: usize = 8192;
+/// HTX tickers report rolling 24h volume; dividing by minutes gives a stable
+/// fallback baseline even before the bot has observed a full minute itself.
+const MINUTES_PER_DAY: u64 = 1_440;
+
 /// Everything the rest of the bot needs to know about one symbol right now.
 #[derive(Debug, Clone, Default)]
 pub struct MarketSnapshot {
@@ -43,6 +57,12 @@ pub struct MarketSnapshot {
     pub move_pct: Option<Decimal>,
     /// `true` when the latest tick set off the anomaly detector.
     pub anomaly: bool,
+    /// Quote (USDT) volume printed over the last 60 seconds.
+    pub volume_1m: Decimal,
+    /// Normal one-minute volume used by the spike test.
+    pub volume_baseline_1m: Decimal,
+    /// `true` when `volume_1m` is at least twice the baseline.
+    pub volume_spike: bool,
     pub updated_ns: u128,
 }
 
@@ -76,21 +96,34 @@ pub struct Signal {
     pub side: Side,
     pub price: Decimal,
     pub move_pct: Decimal,
+    /// `true` when the dip arrived with a genuine volume spike.
+    pub volume_spike: bool,
     pub reason: String,
+}
+
+/// One executed print, kept for the rolling volume calculation.
+#[derive(Debug, Clone, Copy)]
+struct VolumeSample {
+    at_ns: u128,
+    quote: Decimal,
 }
 
 /// Rolling state for one symbol.
 #[derive(Debug)]
 struct Book {
     window: VecDeque<Decimal>,
+    volume: VecDeque<VolumeSample>,
+    expected_minute_volume: Decimal,
     snapshot: MarketSnapshot,
     last_anomaly: Option<Instant>,
 }
 
 impl Book {
-    fn new(symbol: &str) -> Self {
+    fn new(symbol: &str, expected_minute_volume: Decimal) -> Self {
         Self {
             window: VecDeque::with_capacity(quant_core::ANOMALY_WINDOW_TICKS),
+            volume: VecDeque::new(),
+            expected_minute_volume,
             snapshot: MarketSnapshot {
                 symbol: symbol.to_string(),
                 ..MarketSnapshot::default()
@@ -104,8 +137,11 @@ impl Book {
     fn on_event(&mut self, event: &MarketEvent) -> Option<(Side, Decimal, Decimal, String)> {
         match event {
             MarketEvent::Trade {
-                price, received_ns, ..
-            } => self.on_trade(*price, *received_ns),
+                price,
+                amount,
+                received_ns,
+                ..
+            } => self.on_trade(*price, *amount, *received_ns),
             MarketEvent::Depth {
                 best_bid,
                 best_ask,
@@ -127,10 +163,12 @@ impl Book {
     fn on_trade(
         &mut self,
         price: Decimal,
+        amount: Decimal,
         received_ns: u128,
     ) -> Option<(Side, Decimal, Decimal, String)> {
         self.snapshot.last_price = Some(price);
         self.snapshot.updated_ns = received_ns;
+        self.record_volume(price, amount, received_ns);
 
         if self.window.len() == quant_core::ANOMALY_WINDOW_TICKS {
             self.window.pop_front();
@@ -165,6 +203,13 @@ impl Book {
             return None;
         }
 
+        // A quiet drift down is not panic selling: without a volume spike the
+        // rebound has no fuel and the spread/fees eat the trade. Do not arm the
+        // cooldown either, so a real spike moments later can still signal.
+        if !self.snapshot.volume_spike {
+            return None;
+        }
+
         if self
             .last_anomaly
             .is_some_and(|at| at.elapsed() < ANOMALY_COOLDOWN)
@@ -180,11 +225,83 @@ impl Book {
             price,
             self.snapshot.move_pct.unwrap_or_default().round_dp(3),
             format!(
-                ">{}% dip across {} ticks (buying the rebound)",
+                ">{}% dip across {} ticks with 1m volume {} USDT (spike; baseline {})",
                 quant_core::ANOMALY_THRESHOLD_PCT,
-                prices.len()
+                prices.len(),
+                self.snapshot.volume_1m.round_dp(0),
+                self.snapshot.volume_baseline_1m.round_dp(0)
             ),
         ))
+    }
+
+    /// Recomputes the rolling quote volume and the volume-spike verdict.
+    ///
+    /// The baseline is the larger of the previous minute's flow and the 24h
+    /// average minute (fed from scanner metadata). That makes the filter useful
+    /// from the first tick without being fooled by a single quiet minute.
+    fn record_volume(&mut self, price: Decimal, amount: Decimal, received_ns: u128) {
+        let quote = price * amount;
+        if quote <= Decimal::ZERO {
+            self.snapshot.volume_spike = false;
+            return;
+        }
+
+        let at_ns = if received_ns == 0 {
+            self.volume.back().map(|sample| sample.at_ns).unwrap_or(0)
+        } else {
+            received_ns
+        };
+        self.volume.push_back(VolumeSample { at_ns, quote });
+        if self.volume.len() > VOLUME_SAMPLES_CAP {
+            self.volume.pop_front();
+        }
+
+        let latest = at_ns.max(
+            self.volume
+                .back()
+                .map(|sample| sample.at_ns)
+                .unwrap_or_default(),
+        );
+        let cutoff = latest.saturating_sub(VOLUME_WINDOW_NS);
+        while self
+            .volume
+            .front()
+            .is_some_and(|sample| sample.at_ns < cutoff)
+        {
+            self.volume.pop_front();
+        }
+
+        let recent_cutoff = latest.saturating_sub(VOLUME_RECENT_NS);
+        let mut recent = Decimal::ZERO;
+        let mut previous = Decimal::ZERO;
+        for sample in &self.volume {
+            if sample.at_ns >= recent_cutoff {
+                recent += sample.quote;
+            } else {
+                previous += sample.quote;
+            }
+        }
+
+        let baseline = if previous > Decimal::ZERO {
+            previous.max(self.expected_minute_volume)
+        } else {
+            self.expected_minute_volume
+        };
+        let spike = if baseline > Decimal::ZERO {
+            recent >= baseline * VOLUME_SPIKE_MULTIPLIER
+        } else {
+            // With no baseline at all (a pinned pair outside the scanner), any
+            // real flow is the best spike evidence available.
+            recent > Decimal::ZERO
+        };
+
+        self.snapshot.volume_1m = recent;
+        self.snapshot.volume_baseline_1m = baseline;
+        self.snapshot.volume_spike = recent > Decimal::ZERO && spike;
+    }
+
+    fn set_expected_minute_volume(&mut self, volume: Decimal) {
+        self.expected_minute_volume = volume;
     }
 }
 
@@ -197,6 +314,8 @@ pub struct MarketBoard {
     /// Venue steps kept for every tracked symbol, including a pinned one after
     /// the scanner rotated it out.
     meta: HashMap<String, (Decimal, Decimal)>,
+    /// Normal one-minute volume from the scanner's 24h figure.
+    expected_minute_volume: HashMap<String, Decimal>,
     pinned: Option<String>,
 }
 
@@ -216,11 +335,19 @@ impl MarketBoard {
     /// Replaces the scanner watchlist. Books for symbols that left the list are
     /// pruned unless the symbol is pinned by an open position.
     pub fn set_pairs(&mut self, pairs: Vec<PairInfo>) {
-        self.active = pairs.iter().map(|pair| pair.symbol.clone()).collect();
+        let mut active = HashSet::new();
         for pair in &pairs {
+            active.insert(pair.symbol.clone());
             self.meta
                 .insert(pair.symbol.clone(), (pair.base_step, pair.price_step));
+            let expected = pair.quote_volume / Decimal::from(MINUTES_PER_DAY);
+            self.expected_minute_volume
+                .insert(pair.symbol.clone(), expected);
+            if let Some(book) = self.books.get_mut(&pair.symbol) {
+                book.set_expected_minute_volume(expected);
+            }
         }
+        self.active = active;
         self.pairs = pairs;
         self.prune();
     }
@@ -249,6 +376,7 @@ impl MarketBoard {
         let keep = |symbol: &String| active.contains(symbol) || pinned == Some(symbol.as_str());
         self.books.retain(|symbol, _| keep(symbol));
         self.meta.retain(|symbol, _| keep(symbol));
+        self.expected_minute_volume.retain(|symbol, _| keep(symbol));
     }
 
     /// Feeds one event into the matching book. Returns a signal only when the
@@ -264,7 +392,10 @@ impl MarketBoard {
         let book = self
             .books
             .entry(symbol.to_string())
-            .or_insert_with(|| Book::new(symbol));
+            .or_insert_with(|| Book::new(symbol, Decimal::ZERO));
+        if let Some(expected) = self.expected_minute_volume.get(symbol) {
+            book.set_expected_minute_volume(*expected);
+        }
         let draft = book.on_event(event);
 
         if !eligible {
@@ -275,6 +406,10 @@ impl MarketBoard {
             side,
             price,
             move_pct,
+            volume_spike: self
+                .books
+                .get(symbol)
+                .is_some_and(|book| book.snapshot.volume_spike),
             reason,
         })
     }
@@ -317,6 +452,8 @@ impl MarketBoard {
                 .map(|value| format!("{}bps", value.round_dp(1).normalize()))
                 .unwrap_or_else(|| "-".to_string());
             let anomaly = book.is_some_and(|snapshot| snapshot.anomaly);
+            let volume_1m = book.map_or(Decimal::ZERO, |snapshot| snapshot.volume_1m);
+            let volume_spike = book.is_some_and(|snapshot| snapshot.volume_spike);
             let bid = book
                 .and_then(|snapshot| snapshot.best_bid)
                 .map(|value| value.to_string())
@@ -327,7 +464,7 @@ impl MarketBoard {
                 .unwrap_or_else(|| "-".to_string());
 
             lines.push(format!(
-                "{}. {} last={} bid={} ask={} spread={} chg24={}% amp24={}% vol24={} anomaly={}",
+                "{}. {} last={} bid={} ask={} spread={} chg24={}% amp24={}% vol24={} vol1m={} volume_spike: {} anomaly={}",
                 index + 1,
                 pair.symbol.to_uppercase(),
                 last,
@@ -337,6 +474,8 @@ impl MarketBoard {
                 pair.change_pct.round_dp(2),
                 pair.amplitude_pct.round_dp(2),
                 pair.quote_volume.round_dp(0),
+                volume_1m.round_dp(0),
+                if volume_spike { "yes" } else { "no" },
                 if anomaly { "yes" } else { "no" }
             ));
         }
@@ -354,9 +493,14 @@ mod tests {
     }
 
     fn trade(symbol: &str, price: &str) -> MarketEvent {
+        trade_with_amount(symbol, price, "100")
+    }
+
+    fn trade_with_amount(symbol: &str, price: &str, amount: &str) -> MarketEvent {
         MarketEvent::Trade {
             symbol: symbol.to_string(),
             price: dec(price),
+            amount: dec(amount),
             exchange_ts_ms: 0,
             received_ns: 1,
         }
@@ -426,7 +570,24 @@ mod tests {
         assert_eq!(signal.side, Side::Buy);
         assert_eq!(signal.price, dec("98.5"));
         assert_eq!(signal.move_pct, dec("1.523"));
+        assert!(signal.volume_spike);
         assert!(signal.reason.contains("dip"));
+        assert!(signal.reason.contains("volume"));
+    }
+
+    #[test]
+    fn a_quiet_dip_without_volume_is_ignored() {
+        let mut board = board();
+        board.apply(&trade_with_amount("btcusdt", "100", "0.001"));
+        assert!(
+            board
+                .apply(&trade_with_amount("btcusdt", "98.5", "0.001"))
+                .is_none(),
+            "a quiet drift down is not panic selling"
+        );
+        let snapshot = board.snapshot("btcusdt").expect("book must exist");
+        assert!(snapshot.anomaly);
+        assert!(!snapshot.volume_spike);
     }
 
     #[test]
@@ -511,6 +672,7 @@ mod tests {
     #[test]
     fn describe_pairs_includes_volatility_and_live_spread() {
         let mut board = board();
+        board.apply(&trade("listausdt", "0.1"));
         board.apply(&depth("listausdt", "0.1", "0.1001"));
 
         let text = board.describe_pairs();
@@ -518,5 +680,7 @@ mod tests {
         assert!(text.contains("amp24=20%"));
         assert!(text.contains("spread=10bps"));
         assert!(text.contains("vol24=5000000"));
+        assert!(text.contains("vol1m=10"));
+        assert!(text.contains("volume_spike: no"));
     }
 }

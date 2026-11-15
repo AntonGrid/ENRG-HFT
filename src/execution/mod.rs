@@ -34,12 +34,35 @@ impl Side {
             Self::Sell => "SELL",
         }
     }
+}
 
-    /// HTX v1 spot order type for a limit order in this direction.
-    pub fn htx_order_type(self) -> &'static str {
+/// How an order is allowed to interact with the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderKind {
+    /// Post-only limit: the venue rejects it rather than let it cross the
+    /// spread. Used for entries and take-profit exits.
+    MakerLimit,
+    /// Immediate market order. Used for stop-loss, the kill switch and
+    /// startup liquidation, where getting out matters more than the fee.
+    Market,
+}
+
+impl OrderKind {
+    /// HTX v1 spot order type for this direction.
+    pub fn htx_order_type(self, side: Side) -> &'static str {
+        match (self, side) {
+            (Self::MakerLimit, Side::Buy) => "buy-limit-maker",
+            (Self::MakerLimit, Side::Sell) => "sell-limit-maker",
+            (Self::Market, Side::Buy) => "buy-market",
+            (Self::Market, Side::Sell) => "sell-market",
+        }
+    }
+
+    /// Uppercase label used in executor logs.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Buy => "buy-limit",
-            Self::Sell => "sell-limit",
+            Self::MakerLimit => "MAKER",
+            Self::Market => "MARKET",
         }
     }
 }
@@ -88,15 +111,15 @@ impl OrderStatus {
     }
 }
 
-/// A limit order. Both spot venues require the price up front, so the executor
-/// always sends a limit order and makes it marketable by pricing it through the
-/// touch with a small slippage allowance.
+/// A spot order. Maker orders carry a non-crossing limit price; market orders
+/// still carry a reference price for sizing, risk checks and paper accounting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderRequest {
     pub symbol: String,
     pub side: Side,
     pub amount: Decimal,
     pub price: Decimal,
+    pub kind: OrderKind,
     pub client_order_id: String,
 }
 
@@ -222,8 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn sides_map_to_htx_order_types() {
-        assert_eq!(Side::Buy.htx_order_type(), "buy-limit");
-        assert_eq!(Side::Sell.htx_order_type(), "sell-limit");
+    fn order_kinds_map_to_htx_order_types() {
+        assert_eq!(
+            OrderKind::MakerLimit.htx_order_type(Side::Buy),
+            "buy-limit-maker"
+        );
+        assert_eq!(
+            OrderKind::MakerLimit.htx_order_type(Side::Sell),
+            "sell-limit-maker"
+        );
+        assert_eq!(OrderKind::Market.htx_order_type(Side::Buy), "buy-market");
+        assert_eq!(OrderKind::Market.htx_order_type(Side::Sell), "sell-market");
     }
 }

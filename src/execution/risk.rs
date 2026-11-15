@@ -288,6 +288,7 @@ impl RiskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::OrderKind;
     use std::str::FromStr;
 
     fn dec(value: &str) -> Decimal {
@@ -311,6 +312,7 @@ mod tests {
             side,
             amount: dec(amount),
             price: dec(price),
+            kind: OrderKind::MakerLimit,
             client_order_id: "test".into(),
         }
     }
