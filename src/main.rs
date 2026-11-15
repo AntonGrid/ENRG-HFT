@@ -365,11 +365,12 @@ fn log_watchlist_changes(before: &[String], after: &[String]) {
 
 fn log_signal(signal: &Signal) {
     println!(
-        "[SIGNAL] {} {} {} ({}%) volume_spike={} — {}",
+        "[SIGNAL] {} {} {} ({}%) {} volume_spike={} — {}",
         signal.symbol.to_uppercase(),
         signal.side.as_str(),
         signal.price,
         signal.move_pct,
+        signal.kind.as_str(),
         if signal.volume_spike { "yes" } else { "no" },
         signal.reason
     );
@@ -380,10 +381,11 @@ async fn drain_commands(mut commands: mpsc::Receiver<ExecutionCommand>) {
     while let Some(command) = commands.recv().await {
         if let ExecutionCommand::Signal(signal) = command {
             println!(
-                "[SIGNAL] (execution off) {} {} {} — {}",
+                "[SIGNAL] (execution off) {} {} {} {} — {}",
                 signal.symbol.to_uppercase(),
                 signal.side.as_str(),
                 signal.price,
+                signal.kind.as_str(),
                 signal.reason
             );
         }

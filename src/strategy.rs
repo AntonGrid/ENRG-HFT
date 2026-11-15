@@ -7,8 +7,9 @@
 //! Two consumers read the same board:
 //!
 //! * the strategy emits a [`Signal`] with the symbol that produced it. Spot is
-//!   long-only: only a downside dislocation produces `BUY`, and `SELL` is left
-//!   entirely to the executor's exit path for an already-open position;
+//!   long-only: a downside dislocation produces a dip `BUY`, an upside
+//!   dislocation a momentum `BUY`, and `SELL` is left entirely to the
+//!   executor's exit path for an already-open position;
 //! * the executor reads the freshest [`MarketSnapshot`] for the symbol it is
 //!   about to trade or is currently holding, and the AI layer reads
 //!   [`MarketBoard::describe_pairs`] for its minute-by-minute verdict.
@@ -89,6 +90,24 @@ impl MarketSnapshot {
     }
 }
 
+/// Which dislocation produced an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// Buy the rebound after a >1% drop.
+    Dip,
+    /// Buy the continuation of a >1% move up.
+    Momentum,
+}
+
+impl EntryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dip => "dip",
+            Self::Momentum => "momentum",
+        }
+    }
+}
+
 /// A long-only entry opportunity. The executor decides whether to act.
 #[derive(Debug, Clone)]
 pub struct Signal {
@@ -96,9 +115,19 @@ pub struct Signal {
     pub side: Side,
     pub price: Decimal,
     pub move_pct: Decimal,
-    /// `true` when the dip arrived with a genuine volume spike.
+    /// `true` when the dislocation arrived with a genuine volume spike.
     pub volume_spike: bool,
+    pub kind: EntryKind,
     pub reason: String,
+}
+
+/// A candidate before the board attaches the symbol and its volume verdict.
+struct Draft {
+    side: Side,
+    price: Decimal,
+    move_pct: Decimal,
+    kind: EntryKind,
+    reason: String,
 }
 
 /// One executed print, kept for the rolling volume calculation.
@@ -132,9 +161,9 @@ impl Book {
         }
     }
 
-    /// Returns `(side, price, move_pct, reason)` on a fresh dip. The side is
-    /// always [`Side::Buy`]: spot never enters short.
-    fn on_event(&mut self, event: &MarketEvent) -> Option<(Side, Decimal, Decimal, String)> {
+    /// Returns the entry candidate on a fresh dislocation. The side is always
+    /// [`Side::Buy`]: spot never enters short.
+    fn on_event(&mut self, event: &MarketEvent) -> Option<Draft> {
         match event {
             MarketEvent::Trade {
                 price,
@@ -160,12 +189,7 @@ impl Book {
         }
     }
 
-    fn on_trade(
-        &mut self,
-        price: Decimal,
-        amount: Decimal,
-        received_ns: u128,
-    ) -> Option<(Side, Decimal, Decimal, String)> {
+    fn on_trade(&mut self, price: Decimal, amount: Decimal, received_ns: u128) -> Option<Draft> {
         self.snapshot.last_price = Some(price);
         self.snapshot.updated_ns = received_ns;
         self.record_volume(price, amount, received_ns);
@@ -194,17 +218,25 @@ impl Book {
             return None;
         }
 
-        // Spot is long-only: a pump is not an entry. Buying strength at the
-        // top of a >1% move is exactly the trade the old directional signal
-        // used to take, and on spot it can only end in a losing round trip.
-        // Only downside dislocations arm an entry.
+        // Spot is long-only, so every dislocation is a potential BUY: a drop is
+        // bought as a rebound (dip), a rise is bought as a continuation
+        // (momentum). A spike that prints and closes near its origin is neither.
         let first = self.window.front().copied().unwrap_or(price);
-        if price >= first {
+        let net_pct = if first > Decimal::ZERO {
+            (price - first) / first * Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+        let kind = if price < first {
+            EntryKind::Dip
+        } else if net_pct > Decimal::from(quant_core::ANOMALY_THRESHOLD_PCT) {
+            EntryKind::Momentum
+        } else {
             return None;
-        }
+        };
 
-        // A quiet drift down is not panic selling: without a volume spike the
-        // rebound has no fuel and the spread/fees eat the trade. Do not arm the
+        // A quiet drift is not a tradable dislocation: without a volume spike
+        // the move has no fuel and the spread/fees eat the trade. Do not arm the
         // cooldown either, so a real spike moments later can still signal.
         if !self.snapshot.volume_spike {
             return None;
@@ -216,22 +248,36 @@ impl Book {
         {
             return None;
         }
-        // A pump is ignored above, so it must not arm the cooldown either: the
-        // next real dip is allowed to signal immediately.
         self.last_anomaly = Some(Instant::now());
 
-        Some((
-            Side::Buy,
-            price,
-            self.snapshot.move_pct.unwrap_or_default().round_dp(3),
-            format!(
+        let move_pct = self.snapshot.move_pct.unwrap_or_default().round_dp(3);
+        let volume = self.snapshot.volume_1m.round_dp(0);
+        let baseline = self.snapshot.volume_baseline_1m.round_dp(0);
+        let reason = match kind {
+            EntryKind::Dip => format!(
                 ">{}% dip across {} ticks with 1m volume {} USDT (spike; baseline {})",
                 quant_core::ANOMALY_THRESHOLD_PCT,
                 prices.len(),
-                self.snapshot.volume_1m.round_dp(0),
-                self.snapshot.volume_baseline_1m.round_dp(0)
+                volume,
+                baseline
             ),
-        ))
+            EntryKind::Momentum => format!(
+                ">{}% momentum across {} ticks (+{}%) with 1m volume {} USDT (spike; baseline {})",
+                quant_core::ANOMALY_THRESHOLD_PCT,
+                prices.len(),
+                net_pct.round_dp(3),
+                volume,
+                baseline
+            ),
+        };
+
+        Some(Draft {
+            side: Side::Buy,
+            price,
+            move_pct,
+            kind,
+            reason,
+        })
     }
 
     /// Recomputes the rolling quote volume and the volume-spike verdict.
@@ -401,16 +447,17 @@ impl MarketBoard {
         if !eligible {
             return None;
         }
-        draft.map(|(side, price, move_pct, reason)| Signal {
+        draft.map(|draft| Signal {
             symbol: symbol.to_string(),
-            side,
-            price,
-            move_pct,
+            side: draft.side,
+            price: draft.price,
+            move_pct: draft.move_pct,
             volume_spike: self
                 .books
                 .get(symbol)
                 .is_some_and(|book| book.snapshot.volume_spike),
-            reason,
+            kind: draft.kind,
+            reason: draft.reason,
         })
     }
 
@@ -548,14 +595,35 @@ mod tests {
     }
 
     #[test]
-    fn a_pump_does_not_emit_an_entry_signal() {
+    fn a_pump_emits_a_momentum_entry() {
         let mut board = board();
         assert!(board.apply(&trade("listausdt", "100")).is_none());
-        assert!(
-            board.apply(&trade("listausdt", "101.5")).is_none(),
-            "buying a >1% pump on spot is not a long-only entry"
-        );
+        let signal = board
+            .apply(&trade("listausdt", "101.5"))
+            .expect("a >1% breakout with volume must produce a momentum entry");
+
+        assert_eq!(signal.symbol, "listausdt");
+        assert_eq!(signal.side, Side::Buy);
+        assert_eq!(signal.kind, EntryKind::Momentum);
+        assert_eq!(signal.price, dec("101.5"));
+        assert!(signal.volume_spike);
+        assert!(signal.reason.contains("momentum"));
         assert!(board.snapshot("listausdt").unwrap().anomaly);
+    }
+
+    #[test]
+    fn a_quiet_pump_without_volume_is_ignored() {
+        let mut board = board();
+        board.apply(&trade_with_amount("btcusdt", "100", "0.001"));
+        assert!(
+            board
+                .apply(&trade_with_amount("btcusdt", "101.5", "0.001"))
+                .is_none(),
+            "a quiet drift up has no momentum to ride"
+        );
+        let snapshot = board.snapshot("btcusdt").expect("book must exist");
+        assert!(snapshot.anomaly);
+        assert!(!snapshot.volume_spike);
     }
 
     #[test]
@@ -568,6 +636,7 @@ mod tests {
 
         assert_eq!(signal.symbol, "btcusdt");
         assert_eq!(signal.side, Side::Buy);
+        assert_eq!(signal.kind, EntryKind::Dip);
         assert_eq!(signal.price, dec("98.5"));
         assert_eq!(signal.move_pct, dec("1.523"));
         assert!(signal.volume_spike);
@@ -591,15 +660,18 @@ mod tests {
     }
 
     #[test]
-    fn a_pump_does_not_block_the_next_dip() {
+    fn cooldown_covers_both_dip_and_momentum_entries() {
         let mut board = board();
         board.apply(&trade("btcusdt", "100"));
-        assert!(board.apply(&trade("btcusdt", "101.5")).is_none());
+        let momentum = board
+            .apply(&trade("btcusdt", "101.5"))
+            .expect("a pump is a momentum entry");
+        assert_eq!(momentum.kind, EntryKind::Momentum);
 
-        let signal = board
-            .apply(&trade("btcusdt", "98.5"))
-            .expect("the ignored pump must not arm the dip cooldown");
-        assert_eq!(signal.side, Side::Buy);
+        assert!(
+            board.apply(&trade("btcusdt", "98.5")).is_none(),
+            "the shared cooldown must block a back-to-back dip"
+        );
     }
 
     #[test]
