@@ -3,12 +3,12 @@
 //! One task, one state machine:
 //!
 //! ```text
-//! Signal (anomaly) ─┐
+//! Signal (trend)   ─┐
 //!                   ├─> gate: fresh AI TRADE verdict?
 //! AI verdict ───────┘        │
 //!                            ├─> risk guard (size, exposure, cooldown, daily loss)
 //!                            ├─> broker.place (paper or HTX)
-//!                            └─> fills → portfolio/PnL → trailing TP / hard SL
+//!                            └─> fills → portfolio/PnL → ATR trail / SL / trend flip
 //! ```
 //!
 //! The executor never blocks the market-data path: it reads the freshest
@@ -93,12 +93,14 @@ pub struct ExecutorConfig {
     pub max_position_notional: Decimal,
     /// Non-positive disables the daily loss budget.
     pub max_daily_loss: Decimal,
-    /// Unrealised gain (%) that arms the trailing exit.
-    pub trail_activation_pct: Decimal,
-    /// Retrace (%) from the peak that closes the position once armed.
-    pub trail_distance_pct: Decimal,
-    /// Hard stop: the one exit that always fires.
+    /// ATR multiple below the peak that closes the position (chandelier exit).
+    pub trail_atr_multiple: Decimal,
+    /// Trailing distance (%) used until the ATR of the symbol is warm.
+    pub trail_fallback_pct: Decimal,
+    /// Hard stop: the emergency brake that always fires first.
     pub stop_loss_pct: Decimal,
+    /// Close the position when the trend filter flips against the long.
+    pub trend_exit: bool,
     pub cooldown: Duration,
     /// How long an AI verdict stays valid.
     pub gate_ttl: Duration,
@@ -120,9 +122,10 @@ impl ExecutorConfig {
             max_order_notional: env_decimal("EXEC_MAX_ORDER_NOTIONAL_USDT", "50")?,
             max_position_notional: env_decimal("EXEC_MAX_POSITION_NOTIONAL_USDT", "50")?,
             max_daily_loss: env_decimal("EXEC_MAX_DAILY_LOSS_USDT", "20")?,
-            trail_activation_pct: env_decimal("EXEC_TRAIL_ACTIVATION_PCT", "2")?,
-            trail_distance_pct: env_decimal("EXEC_TRAIL_DISTANCE_PCT", "0.5")?,
+            trail_atr_multiple: env_decimal("EXEC_TRAIL_ATR_MULT", "2")?,
+            trail_fallback_pct: env_decimal("EXEC_TRAIL_FALLBACK_PCT", "1.5")?,
             stop_loss_pct: env_decimal("EXEC_STOP_LOSS_PCT", "0.7")?,
+            trend_exit: env_bool("EXEC_TREND_EXIT", true),
             cooldown: env_duration("EXEC_COOLDOWN_SECS", 10)?,
             gate_ttl: env_duration("EXEC_GATE_TTL_SECS", 120)?,
             order_ttl: env_duration("EXEC_ORDER_TTL_SECS", 12)?,
@@ -167,18 +170,18 @@ impl ExecutorConfig {
                 "EXEC_MAX_POSITION_NOTIONAL_USDT must be >= EXEC_MIN_NOTIONAL_USDT".into(),
             ));
         }
-        if self.trail_activation_pct <= Decimal::ZERO
-            || self.trail_distance_pct <= Decimal::ZERO
+        if self.trail_atr_multiple <= Decimal::ZERO
+            || self.trail_fallback_pct <= Decimal::ZERO
             || self.stop_loss_pct <= Decimal::ZERO
         {
             return Err(ExecutionError::Config(
-                "EXEC_TRAIL_ACTIVATION_PCT, EXEC_TRAIL_DISTANCE_PCT and EXEC_STOP_LOSS_PCT must be positive"
+                "EXEC_TRAIL_ATR_MULT, EXEC_TRAIL_FALLBACK_PCT and EXEC_STOP_LOSS_PCT must be positive"
                     .into(),
             ));
         }
-        if self.trail_activation_pct <= self.trail_distance_pct {
+        if self.trail_fallback_pct <= self.stop_loss_pct {
             return Err(ExecutionError::Config(
-                "EXEC_TRAIL_ACTIVATION_PCT must exceed EXEC_TRAIL_DISTANCE_PCT; the trailing floor would sit at or below the entry"
+                "EXEC_TRAIL_FALLBACK_PCT must exceed EXEC_STOP_LOSS_PCT; without a warm ATR the emergency stop has to bind"
                     .into(),
             ));
         }
@@ -214,6 +217,16 @@ fn env_decimal(name: &str, default: &str) -> Result<Decimal, ExecutionError> {
     Decimal::from_str(&raw).map_err(|error| {
         ExecutionError::Config(format!("{name}={raw:?} is not a decimal: {error}"))
     })
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
 }
 
 fn env_duration(name: &str, default_secs: u64) -> Result<Duration, ExecutionError> {
@@ -522,9 +535,8 @@ pub struct Executor {
     open_fees: Decimal,
     opened_at: Option<Instant>,
     /// Highest executable mark (the bid for a long) since the entry filled.
+    /// The ATR trailing stop is measured down from here.
     peak_mark: Option<Decimal>,
-    /// The peak has reached `trail_activation_pct`; the arming is logged once.
-    trail_armed: bool,
     exit_retry_after: Option<Instant>,
     last_mark: Option<Decimal>,
     last_status_poll: Instant,
@@ -587,7 +599,6 @@ impl Executor {
             open_fees: Decimal::ZERO,
             opened_at: None,
             peak_mark: None,
-            trail_armed: false,
             exit_retry_after: None,
             last_mark: None,
             last_status_poll: Instant::now(),
@@ -652,13 +663,13 @@ impl Executor {
     /// closes.
     pub async fn run(mut self, mut commands: mpsc::Receiver<ExecutionCommand>) {
         println!(
-            "[EXEC] mode={} pairs={} order_notional={}USDT trail={}%/{}% sl={}% gate_ttl={}s",
+            "[EXEC] mode={} pairs={} order_notional={}USDT trail={}xATR sl={}% trend_exit={} gate_ttl={}s",
             self.broker.name(),
             self.board().pairs().len(),
             self.cfg.order_notional,
-            self.cfg.trail_activation_pct,
-            self.cfg.trail_distance_pct,
+            self.cfg.trail_atr_multiple,
             self.cfg.stop_loss_pct,
+            self.cfg.trend_exit,
             self.cfg.gate_ttl.as_secs(),
         );
         if !self.broker.is_paper() {
@@ -967,7 +978,6 @@ impl Executor {
                     if self.opened_at.is_none() {
                         self.opened_at = Some(Instant::now());
                         self.peak_mark = Some(price);
-                        self.trail_armed = false;
                     }
                     if self.open_symbol.as_deref() != Some(working.request.symbol.as_str()) {
                         self.open_symbol = Some(working.request.symbol.clone());
@@ -1078,7 +1088,6 @@ impl Executor {
         self.open_fees = Decimal::ZERO;
         self.opened_at = None;
         self.peak_mark = None;
-        self.trail_armed = false;
         self.exit_retry_after = None;
         self.open_symbol = None;
         self.pin_board(None);
@@ -1143,9 +1152,10 @@ impl Executor {
 
     /// Raises the tracked peak with the executable exit mark.
     ///
-    /// The peak only ever moves up, so a retrace is measured from the best price
-    /// the position could actually have been sold at. The trailing state is
-    /// logged here: arming once, then every genuine new high after that.
+    /// The peak only ever moves up, so the trailing stop is measured from the
+    /// best price the position could actually have been sold at. The ATR of the
+    /// symbol sets the distance, so the stop breathes with volatility instead of
+    /// sitting at a fixed percentage.
     fn refresh_peak(&mut self, snapshot: &MarketSnapshot) -> Option<Decimal> {
         if self.working.is_some() || self.portfolio.position.is_flat() || self.opened_at.is_none() {
             return self.peak_mark;
@@ -1162,39 +1172,25 @@ impl Executor {
         let peak = previous.map_or(mark, |peak| peak.max(mark));
         self.peak_mark = Some(peak);
 
-        let peak_gain = (peak - avg) / avg * Decimal::from(100);
-        let armed_now = !self.trail_armed && peak_gain >= self.cfg.trail_activation_pct;
-        if armed_now {
-            self.trail_armed = true;
-        }
-
-        let floor = self.trail_floor(peak);
-        let floor_gain = (floor - avg) / avg * Decimal::from(100);
-        if armed_now {
+        if previous.is_none_or(|previous| peak > previous) {
+            let policy = ExitPolicy::from_config(&self.cfg);
+            let floor = policy.trail_floor(peak, snapshot.atr);
+            let peak_gain = (peak - avg) / avg * Decimal::from(100);
+            let floor_gain = (floor - avg) / avg * Decimal::from(100);
             println!(
-                "[EXEC] TRAIL ARMED {} peak={} (+{}%) floor={} (+{}%)",
+                "[EXEC] TRAIL PEAK {} peak={} (+{}%) stop={} (+{}%) atr={}",
                 snapshot.symbol.to_uppercase(),
                 peak.round_dp(8),
                 peak_gain.round_dp(3),
                 floor.round_dp(8),
-                floor_gain.round_dp(3)
-            );
-        } else if self.trail_armed && previous.is_none_or(|previous| peak > previous) {
-            println!(
-                "[EXEC] TRAIL PEAK {} peak={} (+{}%) floor={} (+{}%)",
-                snapshot.symbol.to_uppercase(),
-                peak.round_dp(8),
-                peak_gain.round_dp(3),
-                floor.round_dp(8),
-                floor_gain.round_dp(3)
+                floor_gain.round_dp(3),
+                snapshot
+                    .atr
+                    .map(|atr| atr.round_dp(8).to_string())
+                    .unwrap_or_else(|| "unwarmed".to_string()),
             );
         }
         Some(peak)
-    }
-
-    /// Price `trail_distance_pct` below `peak`.
-    fn trail_floor(&self, peak: Decimal) -> Decimal {
-        peak * (Decimal::ONE - self.cfg.trail_distance_pct / Decimal::from(100))
     }
 
     /// Periodic maintenance: fills, live status, order expiry, exits.
@@ -1306,7 +1302,6 @@ impl Executor {
         self.open_symbol = None;
         self.opened_at = None;
         self.peak_mark = None;
-        self.trail_armed = false;
         self.exit_retry_after = None;
         self.open_fees = Decimal::ZERO;
         self.last_mark = None;
@@ -1349,19 +1344,14 @@ impl Executor {
             return;
         };
         // A missing peak (e.g. a position adopted without a fill) still gets the
-        // hard stop: fall back to the current mark so the peak gain is zero.
+        // hard stop: fall back to the current mark so the peak is the mark.
         let peak = self.refresh_peak(&snapshot).unwrap_or(mark);
         let pnl_pct = (mark - avg) / avg * Decimal::from(100);
         let peak_gain_pct = (peak - avg) / avg * Decimal::from(100);
+        let policy = ExitPolicy::from_config(&self.cfg);
+        let atr = snapshot.atr;
 
-        let Some(reason) = exit_decision(
-            mark,
-            peak,
-            avg,
-            self.cfg.trail_activation_pct,
-            self.cfg.trail_distance_pct,
-            self.cfg.stop_loss_pct,
-        ) else {
+        let Some(reason) = exit_decision(mark, peak, avg, atr, snapshot.trend_up, &policy) else {
             return;
         };
 
@@ -1376,15 +1366,35 @@ impl Executor {
         // just be a delayed stop-loss, so it hits the market like the hard stop.
         let kind = OrderKind::Market;
         let limit = aggressive_limit(self.cfg.slippage_bps, side, mark, price_step);
-        if reason == ExitReason::TrailingStop {
-            println!(
-                "[EXEC] trailing stop hit {}: peak={} (+{}%) mark={} (+{}%)",
+        match reason {
+            ExitReason::TrailingStop => println!(
+                "[EXEC] ATR trailing stop hit {}: peak={} (+{}%) stop={} atr={} mark={} (+{}%)",
                 symbol.to_uppercase(),
                 peak.round_dp(8),
                 peak_gain_pct.round_dp(3),
+                policy.trail_floor(peak, atr).round_dp(8),
+                atr.map(|atr| atr.round_dp(8).to_string())
+                    .unwrap_or_else(|| "unwarmed".to_string()),
                 mark.round_dp(8),
                 pnl_pct.round_dp(3)
-            );
+            ),
+            ExitReason::TrendFlip => println!(
+                "[EXEC] trend flip exit {}: mark={} pnl={}% adx={} ema_fast={} ema_slow={} ema_trend={}",
+                symbol.to_uppercase(),
+                mark.round_dp(8),
+                pnl_pct.round_dp(3),
+                opt(snapshot.adx, 1),
+                opt(snapshot.ema_fast, 8),
+                opt(snapshot.ema_slow, 8),
+                opt(snapshot.ema_trend, 8),
+            ),
+            ExitReason::StopLoss => println!(
+                "[EXEC] hard stop-loss hit {}: mark={} pnl={}% limit={}%",
+                symbol.to_uppercase(),
+                mark.round_dp(8),
+                pnl_pct.round_dp(3),
+                -self.cfg.stop_loss_pct
+            ),
         }
         let request = OrderRequest {
             symbol: symbol.clone(),
@@ -1682,19 +1692,17 @@ impl Executor {
         self.last_mark = Some(mark);
         self.opened_at = Some(Instant::now());
         self.peak_mark = Some(mark);
-        self.trail_armed = false;
         self.exit_retry_after = None;
         self.open_fees = Decimal::ZERO;
         self.working = None;
 
-        let trail_arm = mark * (Decimal::ONE + self.cfg.trail_activation_pct / Decimal::from(100));
         let stop_loss = mark * (Decimal::ONE - self.cfg.stop_loss_pct / Decimal::from(100));
         println!(
-            "[EXEC] recovered position: {} qty={} entry={} (restart mark) trail_arm={} sl={}",
+            "[EXEC] recovered position: {} qty={} entry={} (restart mark) trail={}xATR sl={}",
             symbol.to_uppercase(),
             qty,
             mark.round_dp(8),
-            trail_arm.round_dp(8),
+            self.cfg.trail_atr_multiple,
             stop_loss.round_dp(8)
         );
         if qty != holding.qty {
@@ -2100,56 +2108,106 @@ fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
     (rounded * step).round_dp_with_strategy(step.scale(), RoundingStrategy::ToZero)
 }
 
+/// Formats an optional reading for a log line.
+fn opt(value: Option<Decimal>, dp: u32) -> String {
+    value
+        .map(|value| value.round_dp(dp).to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 /// Why a position was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
-    /// The position gave back `trail_distance_pct` from its peak after the
-    /// trailing exit had been armed.
+    /// The mark fell `trail_atr_multiple` ATRs below the peak since entry.
     TrailingStop,
+    /// The emergency stop: the position lost `stop_loss_pct`.
     StopLoss,
+    /// The trend filter flipped against the long.
+    TrendFlip,
 }
 
 impl ExitReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::TrailingStop => "trailing-stop",
-            Self::StopLoss => "stop-loss",
+            Self::TrailingStop => "atr-trailing-stop",
+            Self::StopLoss => "hard-stop-loss",
+            Self::TrendFlip => "trend-flip",
         }
+    }
+}
+
+/// The exit rule as data, so the decision can be tested without an executor.
+#[derive(Debug, Clone, Copy)]
+pub struct ExitPolicy {
+    pub stop_loss_pct: Decimal,
+    pub trail_atr_multiple: Decimal,
+    pub trail_fallback_pct: Decimal,
+    pub trend_exit: bool,
+}
+
+impl ExitPolicy {
+    pub fn from_config(cfg: &ExecutorConfig) -> Self {
+        Self {
+            stop_loss_pct: cfg.stop_loss_pct,
+            trail_atr_multiple: cfg.trail_atr_multiple,
+            trail_fallback_pct: cfg.trail_fallback_pct,
+            trend_exit: cfg.trend_exit,
+        }
+    }
+
+    /// How far below the peak the stop sits, in price units.
+    ///
+    /// With a warm ATR the distance is `trail_atr_multiple * ATR`, i.e. measured
+    /// in the same unit as the market's own noise. Without one (a freshly adopted
+    /// position, or a symbol that has not printed enough bars yet) the stop falls
+    /// back to a percentage that is deliberately *wider* than the hard stop, so
+    /// the emergency brake stays the binding constraint.
+    pub fn trail_distance(&self, peak: Decimal, atr: Option<Decimal>) -> Decimal {
+        match atr.filter(|atr| *atr > Decimal::ZERO) {
+            Some(atr) => atr * self.trail_atr_multiple,
+            None => peak * self.trail_fallback_pct / Decimal::from(100),
+        }
+    }
+
+    /// The price the mark must not cross for the position to stay open.
+    pub fn trail_floor(&self, peak: Decimal, atr: Option<Decimal>) -> Decimal {
+        (peak - self.trail_distance(peak, atr)).max(Decimal::ZERO)
     }
 }
 
 /// Pure exit policy for a long position.
 ///
-/// The hard stop is always evaluated first: it is the one exit that must fire
-/// no matter what. The trailing stop only exists once the peak has gained
-/// `activation_pct`; from then on the position is closed as soon as the mark
-/// retraces `distance_pct` from that peak. Because activation exceeds the
-/// distance, an armed position is always sold above the entry.
+/// The order is deliberate:
+///
+/// 1. the hard stop — the one exit that must fire no matter what;
+/// 2. the ATR trailing stop — hands the exit over to the market's own volatility;
+/// 3. the trend flip — the reason the entry existed is gone.
+///
+/// There is no time-based exit and no fixed take-profit: a trend follower lets the
+/// trailing stop decide when the move is over.
 pub(crate) fn exit_decision(
     mark: Decimal,
     peak: Decimal,
     avg_entry: Decimal,
-    activation_pct: Decimal,
-    distance_pct: Decimal,
-    stop_loss_pct: Decimal,
+    atr: Option<Decimal>,
+    trend_up: Option<bool>,
+    policy: &ExitPolicy,
 ) -> Option<ExitReason> {
     if mark <= Decimal::ZERO || peak <= Decimal::ZERO || avg_entry <= Decimal::ZERO {
         return None;
     }
 
     let pnl_pct = (mark - avg_entry) / avg_entry * Decimal::from(100);
-    if stop_loss_pct > Decimal::ZERO && pnl_pct <= -stop_loss_pct {
+    if policy.stop_loss_pct > Decimal::ZERO && pnl_pct <= -policy.stop_loss_pct {
         return Some(ExitReason::StopLoss);
     }
 
-    let peak_gain_pct = (peak - avg_entry) / avg_entry * Decimal::from(100);
-    let retrace_pct = (peak - mark) / peak * Decimal::from(100);
-    if activation_pct > Decimal::ZERO
-        && distance_pct > Decimal::ZERO
-        && peak_gain_pct >= activation_pct
-        && retrace_pct >= distance_pct
-    {
+    if mark <= policy.trail_floor(peak, atr) {
         return Some(ExitReason::TrailingStop);
+    }
+
+    if policy.trend_exit && trend_up == Some(false) {
+        return Some(ExitReason::TrendFlip);
     }
 
     None
@@ -2174,9 +2232,10 @@ mod tests {
             max_order_notional: dec("200"),
             max_position_notional: dec("200"),
             max_daily_loss: dec("50"),
-            trail_activation_pct: dec("2"),
-            trail_distance_pct: dec("0.5"),
+            trail_atr_multiple: dec("2"),
+            trail_fallback_pct: dec("1.5"),
             stop_loss_pct: dec("0.7"),
+            trend_exit: true,
             cooldown: Duration::ZERO,
             gate_ttl: Duration::from_secs(60),
             order_ttl: Duration::from_secs(5),
@@ -2202,7 +2261,7 @@ mod tests {
     }
 
     fn board_with(symbols: &[(&str, &str, &str)]) -> Arc<RwLock<MarketBoard>> {
-        let mut board = MarketBoard::new();
+        let mut board = MarketBoard::with_config(crate::strategy::StrategyConfig::default());
         board.set_pairs(
             symbols
                 .iter()
@@ -2250,10 +2309,11 @@ mod tests {
             symbol: symbol.into(),
             side: Side::Buy,
             price: dec(price),
-            move_pct: dec("1.2"),
+            adx: dec("28"),
+            atr_pct: dec("0.4"),
             volume_spike: true,
-            kind: crate::strategy::EntryKind::Dip,
-            reason: "test dislocation".into(),
+            kind: crate::strategy::EntryKind::Breakout,
+            reason: "test breakout".into(),
         }
     }
 
@@ -2531,7 +2591,6 @@ mod tests {
         assert!(executor.adopt_recovered_position(&holding));
         executor.open_fees = dec("0.01");
         assert_eq!(executor.peak_mark, Some(dec("0.04")));
-        executor.trail_armed = true;
         let cash = executor.portfolio.cash;
 
         executor.drop_tracked_position();
@@ -2541,7 +2600,6 @@ mod tests {
         assert_eq!(executor.open_symbol, None);
         assert_eq!(executor.opened_at, None);
         assert_eq!(executor.peak_mark, None);
-        assert!(!executor.trail_armed);
         assert_eq!(executor.open_fees, Decimal::ZERO);
         assert_eq!(executor.exit_retry_after, None);
         assert!(
@@ -2610,36 +2668,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exit_policy_rides_the_trend_and_keeps_the_hard_stop() {
-        let activation = dec("2");
-        let distance = dec("0.5");
-        let sl = dec("0.7");
-        let entry = dec("100");
+    fn policy() -> ExitPolicy {
+        ExitPolicy {
+            stop_loss_pct: dec("0.7"),
+            trail_atr_multiple: dec("2"),
+            trail_fallback_pct: dec("1.5"),
+            trend_exit: true,
+        }
+    }
 
-        // Below +2% the trail is not armed: a 0.5% wobble is just noise.
+    #[test]
+    fn exit_policy_trails_by_atr_and_keeps_the_hard_stop() {
+        let policy = policy();
+        let entry = dec("100");
+        let atr = Some(dec("0.5"));
+
+        // 2 ATR under a 103 peak is 102: a mark above it keeps the trade alive.
         assert_eq!(
-            exit_decision(dec("101.5"), dec("101.9"), entry, activation, distance, sl),
+            exit_decision(dec("102.2"), dec("103"), entry, atr, Some(true), &policy),
             None
         );
-        // Armed at +3%, still 0.4% off the peak: hold and let it run.
+        // Crossing the ATR trail closes the trade well above the entry.
         assert_eq!(
-            exit_decision(dec("102.6"), dec("103"), entry, activation, distance, sl),
-            None
-        );
-        // A 0.5% retrace from the +3% peak closes the trade.
-        assert_eq!(
-            exit_decision(dec("102.45"), dec("103"), entry, activation, distance, sl),
+            exit_decision(dec("102"), dec("103"), entry, atr, Some(true), &policy),
             Some(ExitReason::TrailingStop)
         );
-        // The hard stop is evaluated first: it always wins.
+        // The hard stop is evaluated first and always wins.
         assert_eq!(
-            exit_decision(dec("99.3"), dec("105"), entry, activation, distance, sl),
+            exit_decision(dec("99.3"), dec("105"), entry, atr, Some(true), &policy),
             Some(ExitReason::StopLoss)
         );
-        // No time-based exit exists any more.
+        // Until the ATR is warm the fallback distance is slightly wider than the
+        // hard stop, so the emergency brake stays the binding constraint.
         assert_eq!(
-            exit_decision(dec("100.1"), dec("100.1"), entry, activation, distance, sl),
+            exit_decision(dec("100.6"), dec("102"), entry, None, Some(true), &policy),
+            None
+        );
+        assert_eq!(
+            exit_decision(dec("100.4"), dec("102"), entry, None, Some(true), &policy),
+            Some(ExitReason::TrailingStop)
+        );
+        // A trend flip closes the trade even when no stop is near.
+        assert_eq!(
+            exit_decision(dec("100.1"), dec("100.1"), entry, atr, Some(false), &policy),
+            Some(ExitReason::TrendFlip)
+        );
+        // A book that is still warming has no trend reading: hold.
+        assert_eq!(
+            exit_decision(dec("100.1"), dec("100.1"), entry, atr, None, &policy),
+            None
+        );
+    }
+
+    #[test]
+    fn the_trend_exit_can_be_disabled() {
+        let mut policy = policy();
+        policy.trend_exit = false;
+        assert_eq!(
+            exit_decision(
+                dec("100.1"),
+                dec("100.1"),
+                dec("100"),
+                Some(dec("0.5")),
+                Some(false),
+                &policy
+            ),
             None
         );
     }
@@ -2722,14 +2815,10 @@ mod tests {
         assert!(executor.portfolio.cash < dec("10000"));
         assert_eq!(executor.open_symbol.as_deref(), Some("btcusdt"));
 
-        // +2% on the bid arms the trailing exit. Nothing is sold yet.
+        // +2% on the bid sets the peak. Nothing is sold yet.
         publish(&board, "btcusdt", "66300", "66301", "66300.5");
         executor.on_tick().await;
         assert_eq!(executor.peak_mark, Some(dec("66300")));
-        assert!(
-            executor.trail_armed,
-            "the +2% activation must arm the trail"
-        );
         assert!(executor.working.is_none(), "no fixed take-profit exists");
         assert_eq!(
             executor.portfolio.position.qty(),
@@ -2743,15 +2832,16 @@ mod tests {
         assert_eq!(executor.peak_mark, Some(dec("66950")));
         assert!(executor.portfolio.position.qty() > Decimal::ZERO);
 
-        // 0.51% off the peak: the trailing stop hits the market and fills.
-        publish(&board, "btcusdt", "66610", "66611", "66610.5");
+        // 1.57% off the peak: the fallback stop (1.5% under the peak, because no
+        // ATR is warm in this synthetic book) is crossed, so the trailing stop
+        // hits the market and fills.
+        publish(&board, "btcusdt", "65900", "65901", "65900.5");
         executor.on_tick().await;
 
         assert!(executor.portfolio.position.is_flat());
         assert!(executor.working.is_none());
         assert!(executor.open_symbol.is_none());
         assert_eq!(executor.peak_mark, None, "a closed trade resets the peak");
-        assert!(!executor.trail_armed);
         assert_eq!(executor.trades, 1);
         assert_eq!(executor.wins, 1);
         assert!(executor.portfolio.position.realized_pnl() > Decimal::ZERO);
@@ -2759,7 +2849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retrace_before_the_trail_arms_is_not_a_take_profit() {
+    async fn a_retrace_inside_the_trailing_stop_keeps_the_trade_open() {
         let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
         publish(&board, "btcusdt", "65000", "65001", "65000.5");
         let mut executor = executor(config(), board.clone());
@@ -2772,15 +2862,14 @@ mod tests {
         executor.on_tick().await;
         assert_eq!(executor.portfolio.position.avg_entry(), dec("65000"));
 
-        // +1.85% is below the activation: the position is left alone.
+        // +1.85% sets a new peak; the fallback stop sits 1.5% under it.
         publish(&board, "btcusdt", "66200", "66201", "66200");
         executor.on_tick().await;
-        assert!(!executor.trail_armed);
         assert!(executor.working.is_none());
         assert_eq!(executor.portfolio.position.qty(), dec("0.001538"));
 
-        // A 1.06% retrace from that peak would have sold a fixed take-profit,
-        // but the trail is not armed, so the trade stays open.
+        // A 1.06% retrace from that peak would have triggered a fixed take-profit
+        // at some other setting, but it is still above the trailing stop.
         publish(&board, "btcusdt", "65500", "65501", "65500");
         executor.on_tick().await;
         assert!(executor.portfolio.position.qty() > Decimal::ZERO);
@@ -2789,7 +2878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_armed_trail_still_yields_to_the_hard_stop() {
+    async fn the_hard_stop_wins_over_the_trailing_stop() {
         let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
         publish(&board, "btcusdt", "65000", "65001", "65000.5");
         let mut executor = executor(config(), board.clone());
@@ -2801,11 +2890,9 @@ mod tests {
         publish(&board, "btcusdt", "64999", "65000", "65000");
         executor.on_tick().await;
 
-        // The peak reaches +3%, so the trail is armed and the exit is watching
-        // a 0.5% retrace from 66950.
+        // The peak reaches +3%: the trailing stop now sits below 66950.
         publish(&board, "btcusdt", "66950", "66951", "66950");
         executor.on_tick().await;
-        assert!(executor.trail_armed);
         assert_eq!(executor.peak_mark, Some(dec("66950")));
 
         // The book collapses straight through the entry: the hard stop wins,
@@ -2818,6 +2905,103 @@ mod tests {
         assert_eq!(executor.trades, 1);
         assert_eq!(executor.wins, 0);
         assert!(executor.portfolio.position.realized_pnl() < Decimal::ZERO);
+    }
+
+    fn set_book_atr(board: &Arc<RwLock<MarketBoard>>, symbol: &str, atr: &str) {
+        board
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_book_atr(symbol, dec(atr));
+    }
+
+    fn set_book_trend(board: &Arc<RwLock<MarketBoard>>, symbol: &str, up: bool) {
+        board
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_book_trend(symbol, up);
+    }
+
+    #[tokio::test]
+    async fn the_atr_trail_closes_the_position_two_atrs_below_the_peak() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board.clone());
+
+        executor.handle_command(verdict(&["btcusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
+            .await;
+        publish(&board, "btcusdt", "64999", "65000", "65000");
+        executor.on_tick().await;
+
+        // The peak reaches 66950 and the book reports a 300-point ATR, so the
+        // chandelier stop sits at 66950 - 2 * 300 = 66350.
+        publish(&board, "btcusdt", "66950", "66951", "66950");
+        executor.on_tick().await;
+        set_book_atr(&board, "btcusdt", "300");
+        assert_eq!(executor.peak_mark, Some(dec("66950")));
+
+        // 60 points above the stop: the trend is still alive.
+        publish(&board, "btcusdt", "66410", "66411", "66410");
+        executor.on_tick().await;
+        assert!(
+            executor.working.is_none(),
+            "the ATR trail must not fire early"
+        );
+        assert!(executor.portfolio.position.qty() > Decimal::ZERO);
+
+        // 50 points below it: the trailing stop takes the market exit.
+        publish(&board, "btcusdt", "66300", "66301", "66300");
+        executor.on_tick().await;
+        assert!(executor.portfolio.position.is_flat());
+        assert!(executor.working.is_none());
+        assert_eq!(executor.trades, 1);
+        assert_eq!(executor.wins, 1, "the ATR trail banks a +2% trend");
+    }
+
+    #[tokio::test]
+    async fn a_trend_flip_closes_the_position() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board.clone());
+
+        executor.handle_command(verdict(&["btcusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
+            .await;
+        publish(&board, "btcusdt", "64999", "65000", "65000");
+        executor.on_tick().await;
+        assert_eq!(executor.portfolio.position.avg_entry(), dec("65000"));
+
+        // No stop is near, but the ribbon and the ADX gate no longer agree. The
+        // trend is forced after the print, because every print re-evaluates it.
+        publish(&board, "btcusdt", "64990", "64991", "64990");
+        set_book_trend(&board, "btcusdt", false);
+        executor.on_tick().await;
+
+        assert!(
+            executor.portfolio.position.is_flat(),
+            "a dead trend is a reason to leave"
+        );
+        assert_eq!(executor.trades, 1);
+    }
+
+    #[tokio::test]
+    async fn a_warming_book_never_exits_on_trend() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board.clone());
+
+        executor.handle_command(verdict(&["btcusdt"])).await;
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
+            .await;
+        publish(&board, "btcusdt", "64999", "65000", "65000");
+        executor.on_tick().await;
+
+        // The synthetic book closes no bars, so trend_up is None: hold.
+        assert!(executor.portfolio.position.qty() > Decimal::ZERO);
+        assert_eq!(executor.trades, 0);
     }
 
     #[tokio::test]
@@ -2929,7 +3113,7 @@ mod tests {
             );
             assert!(
                 executor.portfolio.position.qty() > Decimal::ZERO,
-                "an anomaly on any listed pair must open a position immediately"
+                "a signal on any listed pair must open a position immediately"
             );
 
             // The market trades through the resting bid and confirms the fill.
@@ -3007,10 +3191,11 @@ mod tests {
             symbol: "btcusdt".into(),
             side: Side::Sell,
             price: dec("65000"),
-            move_pct: dec("1.4"),
+            adx: dec("30"),
+            atr_pct: dec("0.4"),
             volume_spike: true,
-            kind: crate::strategy::EntryKind::Momentum,
-            reason: "test dislocation".into(),
+            kind: crate::strategy::EntryKind::Breakout,
+            reason: "test breakout".into(),
         };
         executor
             .handle_command(ExecutionCommand::Signal(signal))

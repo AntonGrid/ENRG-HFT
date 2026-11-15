@@ -34,7 +34,7 @@ use crate::execution::engine::{
     AccountView, ExecutionCommand, ExecutionMode, Executor, ExecutorConfig,
 };
 use crate::scanner::{PairInfo, Scanner, ScannerConfig};
-use crate::strategy::{MarketBoard, Signal};
+use crate::strategy::{MarketBoard, Signal, StrategyConfig};
 
 const DEFAULT_AI_INTERVAL_SECS: u64 = 60;
 
@@ -108,7 +108,10 @@ async fn main() {
         println!("[BOOT] LIVE MODE: orders will be sent to HTX for real money");
     }
 
-    let board = Arc::new(RwLock::new(MarketBoard::new()));
+    let strategy_config = StrategyConfig::from_env();
+    println!("[BOOT] strategy: {}", strategy_config.describe());
+
+    let board = Arc::new(RwLock::new(MarketBoard::with_config(strategy_config)));
 
     // The first scan happens before the socket: the watchlist decides what to
     // subscribe to. A failed scan is not fatal — the rescan loop retries.
@@ -144,7 +147,7 @@ async fn main() {
         htx::run_market_stream(market_tx, symbols_rx).await;
     });
 
-    // Layer 2.5: per-symbol anomaly detection into typed signals.
+    // Layer 2.5: per-symbol bar aggregation, indicators and trend signals.
     let signal_tx = exec_tx.clone();
     let strategy_board = board.clone();
     tokio::spawn(async move {
@@ -365,12 +368,13 @@ fn log_watchlist_changes(before: &[String], after: &[String]) {
 
 fn log_signal(signal: &Signal) {
     println!(
-        "[SIGNAL] {} {} {} ({}%) {} volume_spike={} — {}",
+        "[SIGNAL] {} {} {} {} adx={} atr={}% volume_spike={} — {}",
         signal.symbol.to_uppercase(),
         signal.side.as_str(),
         signal.price,
-        signal.move_pct,
         signal.kind.as_str(),
+        signal.adx.round_dp(1),
+        signal.atr_pct.round_dp(3),
         if signal.volume_spike { "yes" } else { "no" },
         signal.reason
     );

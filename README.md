@@ -1,32 +1,42 @@
 # ENRG-HFT
 
-Hybrid **multi-pair** scalping bot — six layers, one binary.
+Hybrid **multi-pair** trend-following bot — six layers, one binary.
 
 | Layer | Module | Responsibility |
 | --- | --- | --- |
 | 0.5 Scanner | `src/scanner.rs` | Every `SCAN_INTERVAL_SECS` pulls `GET /market/tickers`, keeps liquid USDT spot pairs (24h quote volume ≥ `SCAN_MIN_QUOTE_VOLUME_USDT`), drops stablecoins and leveraged tokens, ranks the rest by 24h amplitude and reads per-pair `amount-precision` / `price-precision` from `/v1/common/symbols`. |
 | 1. Fast hands | `src/exchange/htx.rs` | One HTX WebSocket (`wss://api.htx.com/ws`, fallback `wss://api.huobi.pro/ws`) for **all** scanned pairs: IPv4-only dial, gzip decoding, heartbeat, live `sub`/`unsub` as the watchlist rotates, per-symbol throttled logs, 15s stall watchdog and automatic reconnect. |
-| 2. Mathematics | `src/quant_core.rs` | Exact `Decimal` anomaly detection: more than 1% price move inside the last 10 ticks. |
-| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol, anomaly cooldown per symbol, **long-only** `Signal { symbol, side: BUY, price, kind, volume_spike, … }` on a >1% dip or a >1% momentum breakout, a rolling 1-minute quote-volume versus 24h-average filter, and the multi-pair context read by DeepSeek and the executor. |
+| 2. Mathematics | `src/quant_core.rs` | Exact `Decimal` indicators: OHLC bars, EMA, Wilder ATR and ADX (+DI/-DI) and a rolling VWAP. No `f64` anywhere, so a reading never drifts. |
+| 2.5 Strategy | `src/strategy.rs` | `MarketBoard`: one isolated book per symbol fed by 1-minute bars aggregated from the trade stream. Trend filter = EMA 9/21/50 ribbon + Wilder ADX(14) >= 20 with +DI > -DI + price above the rolling VWAP. Entries are **long-only** `Signal { symbol, side: BUY, price, kind, adx, atr_pct, volume_spike }`: a Donchian-20 **breakout**, or a **pullback** that reclaims EMA 9 inside an intact uptrend. Volume is a conviction bonus, never a gate. |
 | 3. Brain | `src/ai_brain.rs` | DeepSeek `deepseek-chat` risk manager with a strict `{"action":"TRADE"\|"PAUSE","symbols":["…"],"reason":"…"}` contract, polled every `AI_INTERVAL_SECS`. |
 | 4. Muscles | `src/execution/` | Signed HTX REST client, risk guard, portfolio accounting, paper/live broker and the executor that places, tracks and closes orders **on any pair the AI cleared**. |
 
 The AI is a **gate and a pair selector**, not a signal: a `TRADE` verdict opens
 the gate for every symbol in its list for `EXEC_GATE_TTL_SECS`; the quant signal
 on any of those symbols decides *when* to buy. The strategy is **long-only** and
-trades two dislocations of the same anomaly window:
+follows trends in two ways:
 
-- **Dip** — a >1% drop emits `BUY` (buy the rebound);
-- **Momentum** — a >1% rise emits `BUY` (ride the continuation). The trailing
-  exit is what makes this asymmetric: a trend keeps running until it turns,
-  and only a 0.7% hard stop caps the downside.
+- **Breakout** — price crosses above the highest high of the last `STRAT_BREAKOUT_BARS`
+  (20) closed bars while the ribbon and the ADX gate agree;
+- **Pullback** — inside an intact uptrend, a recent bar dipped to EMA 9 and price
+  reclaims it (buy the discount, not the top).
+
+Both entries need the full trend filter: `EMA9 > EMA21`, price above `EMA50`,
+`ADX(14) >= 20` with `+DI > -DI`, and price above the rolling VWAP. A chopping or
+falling market is therefore a no-trade: the bot buys continuation, never a
+falling knife.
 
 A `SELL` is never an entry signal: the executor only sells the position it
-already holds (trailing take-profit, hard stop-loss or kill switch). An entry is
-only tradable when its last minute carries at least **2×** the normal one-minute
-volume (the larger of the previous minute and the 24h average), so a quiet drift
-is ignored. Both kinds share one cooldown, so a pump and the dip after it cannot
-fire back to back.
+already holds (ATR trailing stop, hard stop-loss, trend flip or kill switch).
+Volume never blocks an entry — a spike is recorded on the signal as a conviction
+bonus — and one cooldown per symbol prevents a burst of back-to-back entries.
+
+Bars of `STRAT_BAR_SECS` (60s) are aggregated from the trade stream and the
+indicators only move on bar closes, so nothing is ever computed from a partially
+formed bar. The first signal needs `warmup_bars` (50) closed bars, i.e. about 50
+minutes of streaming; until then the board reports `trend=warming` and stays out
+of the market.
+
 A stale verdict, a `PAUSE`, a symbol outside the scanner watchlist or a missing
 DeepSeek key keeps entries disabled while the bot keeps streaming data. Pair
 names are normalised (`LISTA-USDT` → `listausdt`); a bare base ticker such as
@@ -70,7 +80,7 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
                                                  v
                                        Broker (paper | HTX REST) on that pair
                                                  v
-                              Portfolio/PnL ──> trailing TP / hard SL ──> exit order
+                    Portfolio/PnL ──> ATR trail / hard SL / trend flip ──> exit order
 ```
 
 - **Paper mode** (default) fills market orders at the live touch, rejects a
@@ -109,28 +119,30 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
 
 ## Exit scheme
 
-There is no fixed take-profit and no time-based exit. A winner is ridden until
-the trend turns, using the best **bid** reached since the entry filled as the
-peak:
+There is no fixed take-profit and no time-based exit. Every exit is one of three
+rules, evaluated in this order on every tick, using the best **bid** reached since
+the entry filled as the peak:
 
-| Rule | Trigger |
-| --- | --- |
-| **Hard stop-loss** | Mark ≤ entry − `EXEC_STOP_LOSS_PCT` (0.7%). Evaluated first, always on. |
-| **Trailing take-profit** | Armed once the peak reaches entry + `EXEC_TRAIL_ACTIVATION_PCT` (2%); closes when the mark retraces `EXEC_TRAIL_DISTANCE_PCT` (0.5%) from the peak. |
+| # | Rule | Trigger |
+| --- | --- | --- |
+| 1 | **Hard stop-loss** | Mark <= entry - `EXEC_STOP_LOSS_PCT` (0.7%). The emergency brake: always on and evaluated first. |
+| 2 | **ATR trailing stop** (chandelier) | Mark <= peak - `EXEC_TRAIL_ATR_MULT` (2) x `ATR(14)`. Until the ATR of a symbol is warm the distance falls back to `EXEC_TRAIL_FALLBACK_PCT` (1.5%) of the peak. |
+| 3 | **Trend flip** | The trend filter turns against the long (`EMA9 <= EMA21`, price below `EMA50` or `ADX < 20`). Disable with `EXEC_TREND_EXIT=false`. |
 
-At activation the trail floor sits at peak − 0.5% ≈ +1.5%, always above the
-−0.7% stop, so an armed position is closed in profit unless the book gaps
-straight through the entry — and then the hard stop wins. Example: entry 1.00,
-price runs to 1.05 (floor 1.04475); a tick at 1.0445 sells at the market for
-+4.45%, while a further run to 1.08 keeps the position open with the floor at
-1.0746.
+A trend follower has to let a winner run, so the trailing stop is the exit that
+scales with the move. Because the distance is measured in ATRs, a quiet pair gets
+a tight stop and a wild pair is not shaken out by its own noise. The fallback
+percentage is deliberately *wider* than the hard stop, so an unwarmed ATR can
+never make the emergency brake unreachable. Example: entry 1.00, ATR 0.0077
+(2 x ATR = 0.0154), price runs to 1.05 -> stop at 1.0346; a tick at 1.034 sells at
+the market, a further run to 1.08 lifts the stop to 1.0646.
 
 ```text
-[EXEC] TRAIL ARMED LISTAUSDT peak=1.0200 (+2.00%) floor=1.014900 (+1.49%)
-[EXEC] TRAIL PEAK LISTAUSDT peak=1.0500 (+5.00%) floor=1.044750 (+4.48%)
-[EXEC] trailing stop hit LISTAUSDT: peak=1.0500 (+5.00%) mark=1.0445 (+4.45%)
-[EXEC] placing MARKET SELL 191.7 LISTAUSDT @ 1.0443 — trailing-stop (pnl 4.45%)
-[EXEC] exit fill 191.7 LISTAUSDT @ 1.0445 (fee 0.0400)
+[EXEC] TRAIL PEAK LISTAUSDT peak=1.0200 (+2.00%) stop=1.004600 (+0.46%) atr=0.0077
+[EXEC] TRAIL PEAK LISTAUSDT peak=1.0500 (+5.00%) stop=1.034600 (+3.46%) atr=0.0077
+[EXEC] ATR trailing stop hit LISTAUSDT: peak=1.0500 (+5.00%) stop=1.0346 atr=0.0077 mark=1.0340 (+3.40%)
+[EXEC] placing MARKET SELL 191.7 LISTAUSDT @ 0.1320 — atr-trailing-stop (pnl 3.688%)
+[EXEC] exit fill 191.7 LISTAUSDT @ 1.0340 (fee 0.0400)
 ```
 
 The peak is reset when the trade closes, so the next position starts from its own
@@ -149,9 +161,10 @@ short the venue would refuse. One position at a time across all pairs.
 | `EXEC_MAX_ORDER_NOTIONAL_USDT` | 50 | Hard per-order cap |
 | `EXEC_MAX_POSITION_NOTIONAL_USDT` | 50 | Hard exposure cap (one position at a time) |
 | `EXEC_MAX_DAILY_LOSS_USDT` | 20 | Loss budget; latches entries until the next UTC day |
-| `EXEC_TRAIL_ACTIVATION_PCT` | 2 | Arm the trailing exit at +2% |
-| `EXEC_TRAIL_DISTANCE_PCT` | 0.5 | Sell after a 0.5% retrace from the peak |
+| `EXEC_TRAIL_ATR_MULT` | 2 | Trailing stop distance, in ATRs below the peak |
+| `EXEC_TRAIL_FALLBACK_PCT` | 1.5 | Trail distance while the ATR is not warm yet |
 | `EXEC_STOP_LOSS_PCT` | 0.7 | Hard stop at -0.7% |
+| `EXEC_TREND_EXIT` | true | Close the position when the trend filter flips |
 | `EXEC_COOLDOWN_SECS` | 10 | Pause between accepted entries |
 | `EXEC_ORDER_TTL_SECS` | 12 | Cancel an unfilled maker entry after this many seconds |
 
@@ -203,26 +216,27 @@ Expected console output (paper mode, abridged):
 [WS] subscribed: market.listausdt.trade.detail
 ...
 [WS] streaming 12 symbols over one socket
-[EXEC] mode=paper pairs=12 order_notional=25USDT trail=2%/0.5% sl=0.7% gate_ttl=120s
+[BOOT] strategy: 60s bars, EMA 9/21/50, ADX(14) >= 20, ATR(14), Donchian(20), VWAP(30), warmup 50 bars, cooldown 30s
+[EXEC] mode=paper pairs=12 order_notional=25USDT trail=2xATR sl=0.7% trend_exit=true gate_ttl=120s
 [TICK] LISTAUSDT price=0.1302 latency=41ms
 [DEPTH] FUNUSDT bid=0.001997 ask=0.002003
 [AI] 2026-11-14 16:27:00 UTC asking DeepSeek about 12 pairs:
 watchlist:
-1. LISTAUSDT last=0.1302 bid=0.1301 ask=0.1302 spread=7.7bps chg24=30% amp24=40% vol24=4200000 vol1m=6120 volume_spike: yes anomaly=yes
+1. LISTAUSDT last=0.1302 spread=7.7bps chg24=30% amp24=40% vol24=4200000 vol1m=6120 spike=yes trend=up ema9=0.1298 ema21=0.1281 ema50=0.1262 vwap=0.1291 adx=31.4 +di=28.1 -di=12.6 atr=0.62% breakout=0.1302
 ...
 account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 [AI] 2026-11-14 16:27:02 UTC decision: TRADE [LISTAUSDT, FUNUSDT, TRUMPUSDT] — momentum across the watchlist
 [EXEC] AI gate TRADE 3 pairs: LISTAUSDT, FUNUSDT, TRUMPUSDT — momentum across the watchlist
-[SIGNAL] LISTAUSDT BUY 0.1304 (1.21%) dip volume_spike=yes — >1% dip across 10 ticks with 1m volume 6120 USDT (spike; baseline 2916)
-[EXEC] placing MAKER BUY 191.7 LISTAUSDT @ 0.1301 (signal: >1% dip across 10 ticks with 1m volume 6120 USDT (spike; baseline 2916))
+[SIGNAL] LISTAUSDT BUY 0.1304 breakout adx=31.4 atr=0.62% volume_spike=yes — breakout above the 20-bar high 0.1302 with ema9 > ema21 and price above ema50, adx 31.4 (+DI 28.1 > -DI 12.6), atr 0.62% of price, price above vwap 0.1291, volume 6120 USDT/min (spike)
+[EXEC] placing MAKER BUY 191.7 LISTAUSDT @ 0.1301 (signal: breakout above the 20-bar high 0.1302 ...)
 [EXEC] order paper-1 accepted: submitted
 [EXEC] portfolio pending BUY 191.7 LISTAUSDT @ 0.1301 (order paper-1)
 [EXEC] entry fill 191.7 LISTAUSDT @ 0.1301 (fee 0.0499)
-[EXEC] TRAIL ARMED LISTAUSDT peak=0.1328 (+2.075%) floor=0.132136 (+1.565%)
-[EXEC] TRAIL PEAK LISTAUSDT peak=0.1352 (+3.920%) floor=0.134524 (+3.400%)
-[EXEC] trailing stop hit LISTAUSDT: peak=0.1352 (+3.920%) mark=0.1345 (+3.382%)
-[EXEC] placing MARKET SELL 191.7 LISTAUSDT @ 0.1344 — trailing-stop (pnl 3.382%)
-[EXEC] exit fill 191.7 LISTAUSDT @ 0.1345 (fee 0.0516)
+[EXEC] TRAIL PEAK LISTAUSDT peak=0.1328 (+2.075%) stop=0.129864 (+1.741%) atr=0.0014684
+[EXEC] TRAIL PEAK LISTAUSDT peak=0.1352 (+3.920%) stop=0.1322632 (+3.583%) atr=0.0014684
+[EXEC] ATR trailing stop hit LISTAUSDT: peak=0.1352 (+3.920%) stop=0.1322632 atr=0.0014684 mark=0.1322 (+3.688%)
+[EXEC] placing MARKET SELL 191.7 LISTAUSDT @ 0.1320 — atr-trailing-stop (pnl 3.688%)
+[EXEC] exit fill 191.7 LISTAUSDT @ 0.1322 (fee 0.0516)
 [EXEC] trade #1 closed: net 0.7420 USDT (1 of 1 winners)
 ```
 
@@ -236,8 +250,9 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 - Reference prices for market orders are rounded **outward** to the pair's
   price step, never back inside the touch; maker prices are rounded **towards
   the passive side** and never cross.
-- A dip without a volume spike is ignored: the strategy needs at least 2× the
-  normal one-minute flow, not just a quiet price drift.
+- A trend is required, not just a price move: a breakout without the EMA
+  ribbon, the ADX gate and the VWAP agreement is ignored, and a volume spike
+  only raises the recorded conviction, never the permission.
 - A missing or failing DeepSeek key leaves the gate closed: no entries, but the
   market feed, risk guard and positions remain live.
 - An exit rejected with HTX `order-value-min-error` is logged once and the
@@ -253,13 +268,14 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-128 unit tests, no network required: Decimal anomaly windows, volume-spike
-gating, scanner filtering and ranking, per-symbol books and watchlist pinning,
-DeepSeek JSON
-normalisation with multi-pair selection, HTX frame parsing/gzip/channel routing,
-request signing against an independent golden vector, order/balance parsers,
-portfolio PnL, every risk rejection, the paper broker's fill semantics and
-symbol isolation, sizing/rounding helpers, startup balance recovery (primary
-selection, dust filtering, unquoted assets, stop-loss arming) and full paper
-round-trips through the multi-pair executor. The exit path is also covered for
-the venue-minimum error that drops an unsellable residual instead of retrying.
+132 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
+volume-spike detection, scanner filtering and ranking, per-symbol bar aggregation,
+the trend filter (breakout, pullback, chop, downtrend, warm-up, cooldown), watchlist
+pinning, the exit policy (hard stop, ATR trail, trend flip, unwarmed fallback),
+DeepSeek JSON normalisation with multi-pair selection, HTX frame parsing/gzip/channel
+routing, request signing against an independent golden vector, order/balance parsers,
+portfolio PnL, every risk rejection, the paper broker's fill semantics and symbol
+isolation, sizing/rounding helpers, startup balance recovery (primary selection,
+dust filtering, unquoted assets, stop-loss protection) and full paper round-trips
+through the multi-pair executor. The exit path is also covered for the venue-minimum
+error that drops an unsellable residual instead of retrying.
