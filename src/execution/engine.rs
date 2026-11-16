@@ -45,6 +45,10 @@ const EXIT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RECOVERY_FILL_POLL: Duration = Duration::from_millis(500);
 /// How long startup recovery waits for a liquidation order before cancelling.
 const RECOVERY_FILL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Delay before re-trying a balance the venue refused to sell (below the step,
+/// frozen by an order, or a rejected market order). The retry is bounded by the
+/// balance poll, not by the 250ms tick.
+const LIQUIDATION_RETRY: Duration = Duration::from_secs(30);
 /// HTX rejects spot orders below 1 USDT with `order-value-min-error`.
 const HTX_MIN_ORDER_VALUE_USDT: Decimal = Decimal::ONE;
 /// The venue error code returned when an order is below that minimum.
@@ -92,6 +96,40 @@ impl ExecutionMode {
     }
 }
 
+/// What a balance that is not the managed position may be turned into.
+///
+/// The decision is made from the venue balance sheet alone: an asset bought
+/// before a restart is exactly the asset a rotating top-N watchlist has most
+/// likely dropped, so the watchlist must never decide whether money is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryMode {
+    /// Take the largest tradable balance under management (stop-loss armed) and
+    /// sell everything else back into USDT.
+    Manage,
+    /// Sell every balance back into USDT and stay flat.
+    Liquidate,
+}
+
+impl RecoveryMode {
+    pub fn from_env() -> Result<Self, ExecutionError> {
+        let raw = env_string("EXEC_RECOVER_MODE", "manage").to_ascii_lowercase();
+        match raw.as_str() {
+            "manage" | "adopt" | "hold" => Ok(Self::Manage),
+            "liquidate" | "sell" | "flatten" => Ok(Self::Liquidate),
+            other => Err(ExecutionError::Config(format!(
+                "EXEC_RECOVER_MODE={other:?} is neither \"manage\" nor \"liquidate\""
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manage => "manage",
+            Self::Liquidate => "liquidate",
+        }
+    }
+}
+
 /// Every knob the executor needs, read once at boot.
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -124,6 +162,8 @@ pub struct ExecutorConfig {
     /// Cancel a resting entry once the mark runs this many bps above its limit.
     /// Non-positive disables the check.
     pub entry_max_chase_bps: Decimal,
+    /// What to do with a balance that is not the managed position.
+    pub recover_mode: RecoveryMode,
     pub slippage_bps: Decimal,
     pub fee_bps: Decimal,
     /// Fallback venue steps for symbols the scanner has no metadata for.
@@ -150,6 +190,7 @@ impl ExecutorConfig {
             breakout_taker: env_bool("EXEC_BREAKOUT_TAKER", true),
             maker_offset_ticks: env_u32("EXEC_MAKER_OFFSET_TICKS", 1)?.min(10),
             entry_max_chase_bps: env_decimal("EXEC_ENTRY_MAX_CHASE_BPS", "20")?,
+            recover_mode: RecoveryMode::from_env()?,
             slippage_bps: env_decimal("EXEC_SLIPPAGE_BPS", "5")?,
             fee_bps: env_decimal("EXEC_FEE_BPS", "20")?,
             base_step: env_decimal("EXEC_BASE_STEP", "0.000001")?,
@@ -425,26 +466,120 @@ fn recovery_holdings(
         .collect()
 }
 
-/// Picks the single position to keep under active management.
+/// Venue value the executor does not control.
 ///
-/// Spot is long-only and the executor tracks one position, so the largest
-/// balance with a tradable USDT market becomes the position. Everything else is
-/// a candidate for liquidation. Preferences, borrowed tokens and any market
-/// that [`is_tradable_usdt_symbol`] rejects are never adopted as the position.
-fn pick_primary_holding(holdings: &[RecoveredHolding]) -> Option<usize> {
-    holdings
-        .iter()
-        .enumerate()
-        .filter(|(_, holding)| {
-            holding.mark.unwrap_or_default() > Decimal::ZERO
-                && is_tradable_usdt_symbol(&holding.symbol)
-        })
-        .max_by(|(_, left), (_, right)| {
-            left.notional()
-                .cmp(&right.notional())
-                .then_with(|| right.symbol.cmp(&left.symbol))
-        })
-        .map(|(index, _)| index)
+/// Three things can put money outside the bot's reach: a priced balance it has
+/// not managed to sell yet, a balance with no USDT quote (it cannot be valued or
+/// sold at all) and an audit that could not run. Priced leftovers and a failed
+/// audit block new entries — opening a second position on top of unprotected
+/// money would only hide the problem.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct UnmanagedExposure {
+    /// Priced leftovers, in USDT.
+    value: Decimal,
+    /// Currencies without a USDT quote: they need an operator.
+    unpriced: Vec<String>,
+    /// The balance sheet itself could not be audited.
+    unverified: bool,
+}
+
+impl UnmanagedExposure {
+    fn blocks_entries(&self) -> bool {
+        self.unverified || self.value > Decimal::ZERO
+    }
+
+    fn is_clean(&self) -> bool {
+        !self.unverified && self.value <= Decimal::ZERO && self.unpriced.is_empty()
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.value > Decimal::ZERO {
+            parts.push(format!(
+                "{} USDT of balance is not under management",
+                self.value.round_dp(4)
+            ));
+        }
+        if !self.unpriced.is_empty() {
+            parts.push(format!(
+                "no USDT market to price or sell {}",
+                self.unpriced.join(", ")
+            ));
+        }
+        if self.unverified {
+            parts.push("the venue balance could not be audited".to_string());
+        }
+        parts.join("; ")
+    }
+}
+
+/// When a balance audit runs: at startup, or on the periodic balance poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditPhase {
+    Boot,
+    Poll,
+}
+
+/// The decision the balance audit made for one balance sheet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RecoveryPlan {
+    /// Index of the holding taken under management.
+    adopt: Option<usize>,
+    /// Holdings to sell into USDT.
+    liquidate: Vec<usize>,
+    /// Holdings that are neither managed nor sellable: real money that has to
+    /// be reported instead of forgotten.
+    leftovers: Vec<usize>,
+}
+
+/// Decides what to do with every balance above the venue minimum.
+///
+/// The watchlist plays no part in the decision: the balance sheet is the only
+/// input, so an asset that dropped out of the scanner's top-N is still adopted
+/// (and protected by a stop) or sold — never ignored. In [`RecoveryMode::Manage`]
+/// the largest tradable holding becomes the position and everything else is
+/// liquidated; in [`RecoveryMode::Liquidate`] nothing is adopted and every
+/// sellable balance is sold.
+fn plan_recovery(holdings: &[RecoveredHolding], mode: RecoveryMode) -> RecoveryPlan {
+    let sellable = |holding: &RecoveredHolding| {
+        holding.available > Decimal::ZERO && holding.mark.is_some_and(|mark| mark > Decimal::ZERO)
+    };
+
+    let adopt = match mode {
+        RecoveryMode::Manage => holdings
+            .iter()
+            .enumerate()
+            .filter(|(_, holding)| {
+                !is_dust_holding(holding)
+                    && is_tradable_usdt_symbol(&holding.symbol)
+                    && holding.mark.is_some_and(|mark| mark > Decimal::ZERO)
+            })
+            .max_by(|(_, left), (_, right)| {
+                left.notional()
+                    .cmp(&right.notional())
+                    .then_with(|| right.symbol.cmp(&left.symbol))
+            })
+            .map(|(index, _)| index),
+        RecoveryMode::Liquidate => None,
+    };
+
+    let mut plan = RecoveryPlan {
+        adopt,
+        ..RecoveryPlan::default()
+    };
+    for (index, holding) in holdings.iter().enumerate() {
+        if Some(index) == plan.adopt || is_dust_holding(holding) {
+            continue;
+        }
+        if sellable(holding) {
+            plan.liquidate.push(index);
+        } else {
+            // Unpriced, frozen or held in a quantity below the venue step: it
+            // cannot be sold by the bot and must be reported.
+            plan.leftovers.push(index);
+        }
+    }
+    plan
 }
 
 /// A read-only view of the account, shared with the AI layer.
@@ -459,12 +594,15 @@ pub struct AccountView {
     pub realized_today: Decimal,
     pub trades: u32,
     pub halted: bool,
+    /// Non-USDT value on the venue that the executor is neither managing nor
+    /// has managed to sell. Anything above zero blocks new entries.
+    pub unmanaged_usdt: Decimal,
 }
 
 impl AccountView {
     pub fn describe(&self) -> String {
         format!(
-            "equity={} cash={} position_symbol={} position_qty={} avg_entry={} unrealized={} realized_today={} trades={} halted={}",
+            "equity={} cash={} position_symbol={} position_qty={} avg_entry={} unrealized={} realized_today={} trades={} halted={} unmanaged_usdt={}",
             option_text(self.equity),
             option_text(self.cash),
             self.position_symbol
@@ -476,7 +614,8 @@ impl AccountView {
             option_text(self.unrealized),
             self.realized_today,
             self.trades,
-            if self.halted { "yes" } else { "no" }
+            if self.halted { "yes" } else { "no" },
+            self.unmanaged_usdt.round_dp(4)
         )
     }
 }
@@ -607,6 +746,10 @@ pub struct Executor {
     /// Latest USDT balance of the live venue, mirrored into the AI context.
     live_balance: Option<LiveBalance>,
     last_balance_poll: Instant,
+    /// Non-USDT value the executor can neither manage nor sell.
+    unmanaged: UnmanagedExposure,
+    /// Retry moment for a balance the venue refused to sell.
+    liquidation_retry_at: Option<Instant>,
     halt_logged: bool,
     account_tx: watch::Sender<AccountView>,
     /// Scanner used at startup to price and liquidate balances that are not on
@@ -668,6 +811,8 @@ impl Executor {
             last_status_poll: Instant::now(),
             live_balance: None,
             last_balance_poll: Instant::now(),
+            unmanaged: UnmanagedExposure::default(),
+            liquidation_retry_at: None,
             halt_logged: false,
             account_tx,
             scanner: None,
@@ -727,7 +872,7 @@ impl Executor {
     /// closes.
     pub async fn run(mut self, mut commands: mpsc::Receiver<ExecutionCommand>) {
         println!(
-            "[EXEC] mode={} pairs={} order_notional={}USDT trail={}xATR sl={}% trend_exit={} gate_ttl={}s order_ttl={}s entries={}",
+            "[EXEC] mode={} pairs={} order_notional={}USDT trail={}xATR sl={}% trend_exit={} gate_ttl={}s order_ttl={}s entries={} recover={}",
             self.broker.name(),
             self.board().pairs().len(),
             self.cfg.order_notional,
@@ -741,6 +886,7 @@ impl Executor {
             } else {
                 "breakout:maker pullback:maker"
             },
+            self.cfg.recover_mode.as_str(),
         );
         if !self.broker.is_paper() {
             self.live_preflight().await;
@@ -864,6 +1010,19 @@ impl Executor {
                 "[EXEC] skip {} {}: spot is long-only; SELL only closes an open position",
                 symbol.to_uppercase(),
                 signal.side.as_str()
+            );
+            return;
+        }
+
+        // Money the executor does not control outranks any signal: an unmanaged
+        // balance carries no stop, and opening a position on top of it would
+        // only hide it from the operator.
+        if self.unmanaged.blocks_entries() {
+            println!(
+                "[EXEC] skip {} {}: {}; entries stay off until the account is clean",
+                symbol.to_uppercase(),
+                signal.side.as_str(),
+                self.unmanaged.describe()
             );
             return;
         }
@@ -1781,7 +1940,7 @@ impl Executor {
             );
         }
 
-        self.recover_live_positions(&balances).await;
+        self.audit_balances(balances, AuditPhase::Boot).await;
     }
 
     /// Mirrors the USDT row into the AI context. A missing row means zero.
@@ -1791,104 +1950,252 @@ impl Executor {
         balance
     }
 
-    /// Startup portfolio audit.
+    /// Reconciles the venue balance sheet with what the executor controls.
     ///
-    /// The local portfolio is not persisted, so after a restart the venue is
-    /// the only source of truth. The largest non-USDT balance with a tradable
-    /// USDT market is adopted as the open position at the current mark, with
-    /// TP/SL armed around it. Every other balance is sold into USDT at market.
-    /// A balance worth less than the venue minimum order is logged as dust and
-    /// skipped: it cannot be sold. A balance without a USDT market cannot be
-    /// priced or sold and is reported and left untouched rather than guessed at.
-    async fn recover_live_positions(&mut self, balances: &[Balance]) {
-        if !self.portfolio.position.is_flat() {
-            println!(
-                "[EXEC] recovery skipped: the executor already tracks a {} position",
-                self.open_symbol.as_deref().unwrap_or("?").to_uppercase()
-            );
-            return;
-        }
-
+    /// The local portfolio is not persisted and the watchlist rotates, so after
+    /// a restart (or a manual transfer, or an order placed on the web UI) the
+    /// venue is the only source of truth. Every non-USDT balance is run through
+    /// [`plan_recovery`]: the largest tradable one is taken under management
+    /// with a stop armed, everything else is sold into USDT, and anything that
+    /// can be neither managed nor sold is reported and blocks new entries.
+    ///
+    /// The audit never consults the watchlist — that is the whole point of it.
+    async fn audit_balances(&mut self, balances: Vec<Balance>, phase: AuditPhase) {
         let Some(scanner) = self.scanner.clone() else {
             eprintln!(
-                "[EXEC] recovery unavailable: no scanner was wired into the executor; non-USDT balances stay untouched"
+                "[EXEC] CRITICAL: no scanner is wired into the executor, so non-USDT balances cannot be priced or sold"
             );
             return;
         };
         let quotes = match scanner.quotes().await {
             Ok(quotes) => quotes,
             Err(error) => {
+                // Trading blind is worse than not trading: without an audited
+                // balance sheet the bot cannot know what it holds.
                 eprintln!(
-                    "[EXEC] recovery could not load spot quotes ({error}); non-USDT balances stay untouched"
+                    "[EXEC] CRITICAL: the venue ticker board is unavailable ({error}); entries stay off until the account can be audited"
                 );
+                self.set_unmanaged(UnmanagedExposure {
+                    value: self.unmanaged.value,
+                    unpriced: self.unmanaged.unpriced.clone(),
+                    unverified: true,
+                });
                 return;
             }
         };
 
-        let found = recovery_holdings(balances, &quotes, self.cfg.base_step, self.cfg.price_step);
-        if found.is_empty() {
-            println!("[EXEC] recovery: no non-USDT balances");
+        let mut holdings =
+            recovery_holdings(&balances, &quotes, self.cfg.base_step, self.cfg.price_step);
+        // Only the boot audit narrates every balance: a poll runs every 30s and
+        // `set_unmanaged` already logs each change, so repeating the sheet would
+        // bury the signal in noise.
+        let verbose = phase == AuditPhase::Boot;
+        self.price_unquoted_holdings(&mut holdings, &scanner, verbose)
+            .await;
+        self.forget_managed_holdings(&mut holdings);
+
+        if holdings.is_empty() {
+            if phase == AuditPhase::Boot {
+                println!("[EXEC] recovery: no non-USDT balances");
+            }
+            self.set_unmanaged(UnmanagedExposure::default());
             return;
         }
 
-        let mut holdings = Vec::with_capacity(found.len());
-        for holding in found {
-            if is_dust_holding(&holding) {
-                println!(
-                    "[EXEC] ignoring dust: {} qty={} value={}",
-                    holding.currency,
-                    holding.qty,
-                    holding.notional().round_dp(8)
-                );
+        for holding in &holdings {
+            if is_dust_holding(holding) {
+                if verbose {
+                    println!(
+                        "[EXEC] ignoring dust: {} qty={} value={} (below the venue minimum, it cannot be sold)",
+                        holding.currency,
+                        holding.qty,
+                        holding.notional().round_dp(8)
+                    );
+                }
+                continue;
+            }
+            if !verbose {
                 continue;
             }
             match holding.mark {
                 Some(mark) => println!(
-                    "[EXEC] recovery: found {} qty={} free={} mark={} value={}USDT",
+                    "[EXEC] recovery: found {} qty={} free={} mark={} value={}USDT{}",
                     holding.currency,
                     holding.qty,
                     holding.available,
                     mark,
-                    holding.notional().round_dp(4)
+                    holding.notional().round_dp(4),
+                    if self.board().is_active(&holding.symbol) {
+                        ""
+                    } else {
+                        " (not on the watchlist)"
+                    }
                 ),
                 None => eprintln!(
-                    "[EXEC] recovery: {} qty={} has no USDT market; it cannot be priced or sold and is left untouched",
+                    "[EXEC] recovery: {} qty={} has no USDT market; it cannot be priced or sold and needs an operator",
                     holding.currency, holding.qty
                 ),
             }
-            holdings.push(holding);
-        }
-        if holdings.is_empty() {
-            println!("[EXEC] recovery: nothing tradable left after dust filtering");
         }
 
-        let mut primary = pick_primary_holding(&holdings);
-        if let Some(index) = primary {
+        let plan = plan_recovery(&holdings, self.cfg.recover_mode);
+        self.act_on_recovery_plan(&mut holdings, &plan, &quotes, phase)
+            .await;
+        // The adopted balance is under management now: it must not be counted
+        // as exposure the bot does not control.
+        self.forget_managed_holdings(&mut holdings);
+
+        let exposure = self.exposure_of(&holdings);
+        self.set_unmanaged(exposure);
+        self.publish_account();
+
+        if phase == AuditPhase::Boot {
+            let previous = self.live_balance;
+            match self.sync_live_balance().await {
+                Ok(balance) => log_live_balance(previous, balance),
+                Err(error) => eprintln!("[EXEC] balance refresh after recovery failed: {error}"),
+            }
+        }
+    }
+
+    /// Adopts the managed holding and sells the rest, then recounts the balance
+    /// so `holdings` reflects the venue instead of the plan.
+    async fn act_on_recovery_plan(
+        &mut self,
+        holdings: &mut Vec<RecoveredHolding>,
+        plan: &RecoveryPlan,
+        quotes: &HashMap<String, SpotQuote>,
+        phase: AuditPhase,
+    ) {
+        if let Some(index) = plan.adopt {
             if !self.adopt_recovered_position(&holdings[index]) {
                 eprintln!(
                     "[EXEC] recovery: could not adopt {}; it will be liquidated instead",
                     holdings[index].currency
                 );
-                primary = None;
             }
-        } else if !holdings.is_empty() {
-            eprintln!(
-                "[EXEC] recovery: no balance has a tradable USDT market to manage as a position"
+        } else if self.portfolio.position.is_flat() && phase == AuditPhase::Boot {
+            println!(
+                "[EXEC] recovery: mode={} adopts nothing; every balance is sold into USDT",
+                self.cfg.recover_mode.as_str()
             );
         }
 
-        for (index, holding) in holdings.iter().enumerate() {
-            if Some(index) == primary || holding.mark.is_none() {
-                continue;
-            }
-            self.liquidate_recovered_holding(holding).await;
+        let retry_due = self
+            .liquidation_retry_at
+            .is_none_or(|at| Instant::now() >= at);
+        if plan.liquidate.is_empty() || (phase == AuditPhase::Poll && !retry_due) {
+            return;
         }
 
-        let previous = self.live_balance;
-        match self.sync_live_balance().await {
-            Ok(balance) => log_live_balance(previous, balance),
-            Err(error) => eprintln!("[EXEC] balance refresh after recovery failed: {error}"),
+        for index in &plan.liquidate {
+            self.liquidate_recovered_holding(&holdings[*index], phase)
+                .await;
         }
+        self.liquidation_retry_at = Some(Instant::now() + LIQUIDATION_RETRY);
+        // The venue is the source of truth after a sell: recount instead of
+        // assuming every fill landed.
+        match self.broker.balances().await {
+            Ok(fresh) => {
+                self.remember_live_balance(&fresh);
+                *holdings =
+                    recovery_holdings(&fresh, quotes, self.cfg.base_step, self.cfg.price_step);
+                self.forget_managed_holdings(holdings);
+            }
+            Err(error) => {
+                eprintln!("[EXEC] recovery: could not recount the balance after selling: {error}")
+            }
+        }
+    }
+
+    /// Prices balances the bulk ticker board did not carry.
+    ///
+    /// A freshly listed or renamed market can be missing from `/market/tickers`;
+    /// asking for that symbol directly is what keeps recovery from writing off a
+    /// balance it simply could not see.
+    async fn price_unquoted_holdings(
+        &self,
+        holdings: &mut [RecoveredHolding],
+        scanner: &Scanner,
+        verbose: bool,
+    ) {
+        for holding in holdings.iter_mut().filter(|holding| holding.mark.is_none()) {
+            match scanner.quote_for(&holding.symbol).await {
+                Ok(Some(quote)) => {
+                    holding.mark = quote.mark();
+                    holding.best_bid = quote.best_bid;
+                    holding.best_ask = quote.best_ask;
+                    holding.base_step = quote.base_step;
+                    holding.price_step = quote.price_step;
+                    if verbose {
+                        println!(
+                            "[EXEC] recovery: priced {} from the per-symbol endpoint (mark={})",
+                            holding.currency,
+                            holding
+                                .mark
+                                .map(|mark| mark.round_dp(8))
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if verbose {
+                        eprintln!(
+                            "[EXEC] recovery: could not price {}: {error}",
+                            holding.currency
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops the balances that are already under control: the managed position
+    /// and the symbol of a working order. Adopting or selling them again would
+    /// double-count the exposure or sell underneath a live order.
+    fn forget_managed_holdings(&self, holdings: &mut Vec<RecoveredHolding>) {
+        let managed = self.open_symbol.clone();
+        let working = self
+            .working
+            .as_ref()
+            .map(|working| working.request.symbol.clone());
+        holdings.retain(|holding| {
+            Some(&holding.symbol) != managed.as_ref() && Some(&holding.symbol) != working.as_ref()
+        });
+    }
+
+    /// Value of the balances the executor neither manages nor sold.
+    fn exposure_of(&self, holdings: &[RecoveredHolding]) -> UnmanagedExposure {
+        let mut exposure = UnmanagedExposure::default();
+        for holding in holdings {
+            if is_dust_holding(holding) {
+                continue;
+            }
+            match holding.mark {
+                Some(mark) if mark > Decimal::ZERO => exposure.value += holding.notional(),
+                _ => exposure.unpriced.push(holding.currency.clone()),
+            }
+        }
+        exposure
+    }
+
+    /// Records the unmanaged exposure and logs every change once.
+    fn set_unmanaged(&mut self, exposure: UnmanagedExposure) {
+        if exposure == self.unmanaged {
+            return;
+        }
+        if exposure.blocks_entries() {
+            eprintln!(
+                "[EXEC] CRITICAL: {}; entries stay off until the account is clean",
+                exposure.describe()
+            );
+        } else if exposure.is_clean() {
+            println!("[EXEC] balance audit: every balance is under management");
+        } else {
+            eprintln!("[EXEC] WARNING: {}", exposure.describe());
+        }
+        self.unmanaged = exposure;
     }
 
     /// Restores one recovered balance as the open long position.
@@ -1951,7 +2258,11 @@ impl Executor {
     }
 
     /// Market-sells a non-primary balance back into USDT.
-    async fn liquidate_recovered_holding(&mut self, holding: &RecoveredHolding) {
+    ///
+    /// A boot liquidation may wait for the venue to report the fill; a poll
+    /// liquidation only fires the order and lets the next audit recount, because
+    /// the tick loop must stay responsive to a stop-loss.
+    async fn liquidate_recovered_holding(&mut self, holding: &RecoveredHolding, phase: AuditPhase) {
         if holding.available <= Decimal::ZERO {
             eprintln!(
                 "[EXEC] recovery: {} has no free balance to sell (frozen {})",
@@ -2024,7 +2335,11 @@ impl Executor {
             report.status.as_str()
         );
 
-        let deadline = Instant::now() + RECOVERY_FILL_TIMEOUT;
+        let deadline = Instant::now()
+            + match phase {
+                AuditPhase::Boot => RECOVERY_FILL_TIMEOUT,
+                AuditPhase::Poll => RECOVERY_FILL_POLL * 2,
+            };
         while !report.status.is_terminal() && Instant::now() < deadline {
             tokio::time::sleep(RECOVERY_FILL_POLL).await;
             match self.broker.status(&report).await {
@@ -2079,9 +2394,15 @@ impl Executor {
         Ok(self.remember_live_balance(&balances))
     }
 
-    /// Periodic refresh: keeps `equity`/`cash` in the AI context current.
-    /// Skipped while a position or order is live so the REST call can never
-    /// delay a take-profit/stop-loss decision; the fill path refreshes instead.
+    /// Periodic refresh and balance audit: keeps `equity`/`cash` current for the
+    /// AI context and re-checks every non-USDT balance, so a deposit, a manual
+    /// order or a coin that dropped out of the watchlist can never sit outside
+    /// management unnoticed.
+    ///
+    /// Skipped while a position or an order is live: the venue round-trip must
+    /// never delay a take-profit/stop-loss decision, and balances lag behind an
+    /// order that is still working. The fill path refreshes instead and the next
+    /// flat poll audits the account.
     async fn refresh_live_balance(&mut self) {
         if self.broker.is_paper()
             || self.working.is_some()
@@ -2090,11 +2411,18 @@ impl Executor {
         {
             return;
         }
+        let balances = match self.broker.balances().await {
+            Ok(balances) => balances,
+            Err(error) => {
+                eprintln!("[EXEC] balance refresh failed: {error}");
+                return;
+            }
+        };
+        self.last_balance_poll = Instant::now();
         let previous = self.live_balance;
-        match self.sync_live_balance().await {
-            Ok(balance) => log_live_balance(previous, balance),
-            Err(error) => eprintln!("[EXEC] balance refresh failed: {error}"),
-        }
+        log_live_balance(previous, self.remember_live_balance(&balances));
+        self.publish_account();
+        self.audit_balances(balances, AuditPhase::Poll).await;
     }
 
     fn next_client_id(&self) -> String {
@@ -2166,6 +2494,7 @@ impl Executor {
             realized_today: self.risk.realized_today(),
             trades: self.trades,
             halted: self.risk.is_halted(),
+            unmanaged_usdt: self.unmanaged.value,
         };
         let _ = self.account_tx.send_replace(view);
     }
@@ -2490,6 +2819,7 @@ mod tests {
             breakout_taker: true,
             maker_offset_ticks: 1,
             entry_max_chase_bps: dec("20"),
+            recover_mode: RecoveryMode::Manage,
             slippage_bps: Decimal::ZERO,
             fee_bps: Decimal::ZERO,
             base_step: dec("0.000001"),
@@ -2792,11 +3122,18 @@ mod tests {
         assert_eq!(holdings.len(), 2, "USDT itself is not a position");
         assert!(holdings.iter().all(|holding| holding.currency != "USDT"));
 
-        let primary = pick_primary_holding(&holdings).expect("DNA is manageable");
+        let plan = plan_recovery(&holdings, RecoveryMode::Manage);
+        let primary = plan.adopt.expect("DNA is manageable");
         assert_eq!(
             holdings[primary].currency, "DNA",
             "a stablecoin must never be adopted as the trading position"
         );
+        assert_eq!(
+            plan.liquidate.len(),
+            1,
+            "the stablecoin balance is sold into USDT instead of being left behind"
+        );
+        assert_eq!(holdings[plan.liquidate[0]].currency, "USDC");
     }
 
     #[test]
@@ -2826,8 +3163,162 @@ mod tests {
         assert!(mystery.mark.is_none());
         assert_eq!(mystery.base_step, dec("0.000001"));
 
-        let primary = pick_primary_holding(&holdings).expect("DNA is manageable");
+        let plan = plan_recovery(&holdings, RecoveryMode::Manage);
+        let primary = plan.adopt.expect("DNA is manageable");
         assert_eq!(holdings[primary].currency, "DNA");
+        assert_eq!(
+            plan.leftovers.len(),
+            1,
+            "an unquoted balance is reported, never quietly dropped"
+        );
+        assert_eq!(holdings[plan.leftovers[0]].currency, "MYSTERY");
+    }
+
+    #[test]
+    fn a_coin_that_left_the_scanner_watchlist_is_still_managed() {
+        // The bug this guards: TRUMP was bought, the bot restarted, and the
+        // scanner's top-12 no longer listed it. Recovery saw the balance and
+        // ignored it, so the bot reported `position_qty=0` while 8 USDT sat on
+        // the exchange with no stop. The plan must not consult the watchlist.
+        let balances = vec![
+            Balance {
+                currency: "USDT".into(),
+                available: dec("1.32"),
+                frozen: Decimal::ZERO,
+            },
+            Balance {
+                currency: "TRUMP".into(),
+                available: dec("2"),
+                frozen: dec("0.5"),
+            },
+        ];
+        let quotes = HashMap::from([(
+            "trumpusdt".to_string(),
+            spot_quote("trumpusdt", "3.4", "3.39", "3.41", "0.01", "0.01"),
+        )]);
+        // The board is empty: TRUMPUSDT is not on the watchlist at all.
+        let board = board_with(&[]);
+        assert!(board.read().expect("board lock").pairs().is_empty());
+
+        let holdings = recovery_holdings(&balances, &quotes, dec("0.000001"), dec("0.01"));
+        let plan = plan_recovery(&holdings, RecoveryMode::Manage);
+
+        let index = plan
+            .adopt
+            .expect("a held coin must be taken under management, watchlist or not");
+        assert_eq!(holdings[index].currency, "TRUMP");
+        assert_eq!(
+            holdings[index].qty,
+            dec("2.5"),
+            "the frozen quantity is still owned and must be managed"
+        );
+        assert!(plan.liquidate.is_empty());
+        assert!(
+            plan.leftovers.is_empty(),
+            "nothing may be left unmanaged in manage mode"
+        );
+    }
+
+    #[test]
+    fn the_liquidate_mode_sells_every_balance_and_stays_flat() {
+        let holdings = vec![
+            recovered_holding("TRUMP", "2.5", "2.5", "3.4", "0.01", "0.01"),
+            recovered_holding("DNA", "50", "50", "0.04", "1", "0.0001"),
+        ];
+
+        let managed = plan_recovery(&holdings, RecoveryMode::Manage);
+        assert_eq!(managed.adopt, Some(0), "the larger balance is the position");
+        assert_eq!(managed.liquidate, vec![1], "the smaller one is sold");
+
+        let flat = plan_recovery(&holdings, RecoveryMode::Liquidate);
+        assert_eq!(flat.adopt, None, "liquidate mode never opens a position");
+        assert_eq!(flat.liquidate, vec![0, 1], "every balance is sold");
+    }
+
+    #[test]
+    fn an_unpriced_balance_is_reported_and_the_rest_still_trades() {
+        // A delisted token cannot be valued or sold by the bot: it is reported
+        // loudly, but the account keeps trading everything else.
+        let unpriced = RecoveredHolding {
+            mark: None,
+            ..recovered_holding("OLD", "1000", "1000", "1", "0.01", "0.01")
+        };
+        let holdings = vec![unpriced];
+        let plan = plan_recovery(&holdings, RecoveryMode::Manage);
+        assert_eq!(plan.adopt, None);
+        assert!(plan.liquidate.is_empty());
+        assert_eq!(plan.leftovers, vec![0]);
+
+        let board = board_with(&[]);
+        let executor = executor(config(), board);
+        let exposure = executor.exposure_of(&holdings);
+        assert_eq!(exposure.value, Decimal::ZERO);
+        assert_eq!(exposure.unpriced, vec!["OLD".to_string()]);
+        assert!(
+            !exposure.blocks_entries(),
+            "an asset with no market cannot be acted on; blocking would stop the bot for good"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmanaged_balance_blocks_entries_until_it_is_gone() {
+        let board = board_with(&[("btcusdt", "0.000001", "0.01")]);
+        publish(&board, "btcusdt", "65000", "65001", "65000.5");
+        let mut executor = executor(config(), board.clone());
+        assert!(!executor.unmanaged.blocks_entries());
+
+        // 2.5 TRUMP at 3.4 = 8.5 USDT the bot has not managed to sell yet.
+        let holdings = vec![recovered_holding(
+            "TRUMP", "2.5", "2.5", "3.4", "0.01", "0.01",
+        )];
+        let exposure = executor.exposure_of(&holdings);
+        assert_eq!(exposure.value, dec("8.5"));
+        executor.set_unmanaged(exposure);
+        assert!(executor.unmanaged.blocks_entries());
+
+        assert!(executor.handle_command(verdict(&["btcusdt"])).await);
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
+            .await;
+        assert!(
+            executor.working.is_none(),
+            "money outside management must stop new exposure"
+        );
+        assert!(executor.portfolio.position.is_flat());
+
+        // The leftover is sold: trading resumes on the next signal.
+        executor.set_unmanaged(UnmanagedExposure::default());
+        executor
+            .handle_command(ExecutionCommand::Signal(buy_signal("btcusdt", "65001")))
+            .await;
+        assert!(
+            executor.working.is_some(),
+            "entries resume once the account is clean"
+        );
+    }
+
+    #[test]
+    fn the_adopted_balance_is_not_counted_as_unmanaged() {
+        // The position is under management (its stop is armed), so it must not
+        // be reported as exposure the bot does not control; a second balance
+        // still must be.
+        let board = board_with(&[]);
+        let mut executor = executor(config(), board);
+        let (subscriptions_tx, _subscriptions_rx) = watch::channel(Vec::new());
+        executor.subscriptions_tx = Some(subscriptions_tx);
+
+        let adopted = recovered_holding("TRUMP", "2.5", "2.5", "3.4", "0.01", "0.01");
+        let other = recovered_holding("DNA", "50", "50", "0.04", "1", "0.0001");
+        assert!(executor.adopt_recovered_position(&adopted));
+
+        let mut holdings = vec![adopted, other];
+        executor.forget_managed_holdings(&mut holdings);
+        assert_eq!(holdings.len(), 1, "the managed symbol is filtered out");
+
+        let exposure = executor.exposure_of(&holdings);
+        assert_eq!(exposure.value, dec("2"), "only the unsold DNA is exposure");
+        executor.set_unmanaged(exposure);
+        assert!(executor.unmanaged.blocks_entries());
     }
 
     #[tokio::test]
@@ -2933,6 +3424,26 @@ mod tests {
             view.describe().contains("equity=10.0020 cash=10.0020"),
             "the AI must see the live balance, got {:?}",
             view.describe()
+        );
+        assert!(
+            view.describe().contains("unmanaged_usdt=0"),
+            "a clean account reports no unmanaged value, got {:?}",
+            view.describe()
+        );
+
+        // Money sitting on the venue without a stop is visible to the AI and the
+        // operator: `position_qty=0 cash=1.32` alone is exactly the line that hid
+        // an 8 USDT TRUMP balance.
+        executor.set_unmanaged(UnmanagedExposure {
+            value: dec("8.5"),
+            unpriced: Vec::new(),
+            unverified: false,
+        });
+        executor.publish_account();
+        assert!(
+            rx.borrow().describe().contains("unmanaged_usdt=8.5"),
+            "the leftover must be reported, got {:?}",
+            rx.borrow().describe()
         );
     }
 

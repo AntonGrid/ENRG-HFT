@@ -112,16 +112,29 @@ DeepSeek ──> Verdict(action, symbols) ──> AI gate (TRADE + fresh + symbo
   The live USDT balance is mirrored into the AI context (`equity`/`cash`) every
   30 seconds and right after each fill; an entry is capped to the spendable
   balance so a small account is not rejected by the venue.
-- **Startup recovery** audits the full balance list before the first signal.
-  The largest non-USDT coin with a tradable USDT market is restored as the open
+- **Balance audit** reconciles the venue with what the bot controls: at startup
+  before the first signal, and again on every balance poll while flat. The
+  scanner watchlist plays no part in it — a coin bought before a restart is
+  exactly the coin a rotating top-12 list has dropped, so the decision is made
+  from the balance sheet alone. With `EXEC_RECOVER_MODE=manage` (default) the
+  largest non-USDT coin with a tradable USDT market is restored as the open
   position at the restart mark, pinned into the websocket feed and protected by
-  the same trailing-stop / hard-stop exits. Every other non-USDT balance (stablecoins,
-  leveraged tokens, unrelated coins) is sold into USDT with a **market** order.
-  Balances worth less than HTX's 1 USDT minimum order are logged as
-  `ignoring dust` and left untouched: they can never be sold. A balance with no
-  USDT market is logged and left untouched because it cannot be priced or sold.
-  The original cost basis is not persisted by HTX, so a recovered position is
-  anchored to the current mark.
+  the same trailing-stop / hard-stop exits; every other non-USDT balance
+  (stablecoins, leveraged tokens, unrelated coins) is sold into USDT with a
+  **market** order. `EXEC_RECOVER_MODE=liquidate` sells everything and stays
+  flat. A balance the bulk ticker board does not carry is priced through
+  `/market/detail/merged` before it is written off.
+  Anything that is neither adopted nor sold — a balance whose sell the venue
+  refused, a balance frozen by an order, an asset with no USDT market — is
+  reported as `CRITICAL`/`WARNING` with its value in USDT, surfaced in the
+  account line as `unmanaged_usdt=`, and (when priced) **blocks new entries**
+  until it is gone: money without a stop must never be hidden behind a second
+  position. The sell is retried on the next 30s poll. Balances worth less than
+  HTX's 1 USDT minimum order are logged as `ignoring dust`: they can never be
+  sold. If the ticker board itself is unreachable the audit reports the account
+  as unverified and entries stay off rather than trade blind. The original cost
+  basis is not persisted by HTX, so a recovered position is anchored to the
+  current mark.
 - **Ctrl-C** is a kill switch: the guard latches, working orders are cancelled,
   the position is flattened with one **market** order and a final report is
   printed.
@@ -179,6 +192,7 @@ short the venue would refuse. One position at a time across all pairs.
 | `EXEC_BREAKOUT_TAKER` | true | Send breakout entries as `buy-market` (false: post-only like a pullback) |
 | `EXEC_MAKER_OFFSET_TICKS` | 1 | Venue steps above the bid a pullback entry rests at (never crossing) |
 | `EXEC_ENTRY_MAX_CHASE_BPS` | 20 | Cancel a resting entry once the mark is this far above its limit (0 disables) |
+| `EXEC_RECOVER_MODE` | manage | `manage`: adopt the largest balance and sell the rest; `liquidate`: sell every non-USDT balance and stay flat |
 
 Exits bypass the daily-loss halt and the cooldown, so an open position can
 always be closed.
@@ -286,7 +300,7 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-142 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
+148 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
 volume-spike detection, scanner filtering and ranking, per-symbol bar aggregation,
 the trend filter (breakout, pullback, chop, downtrend, warm-up, cooldown), watchlist
 pinning, the exit policy (hard stop, ATR trail, trend flip, unwarmed fallback),
@@ -295,7 +309,11 @@ routing, request signing against an independent golden vector, order/balance par
 portfolio PnL, every risk rejection, the paper broker's fill semantics and symbol
 isolation, sizing/rounding helpers, startup balance recovery (primary selection,
 dust filtering, unquoted assets, stop-loss protection) and full paper round-trips
-through the multi-pair executor. The exit path is also covered for the venue-minimum
+through the multi-pair executor. The balance audit is covered for the asset that
+dropped out of the watchlist (it is still managed), for `EXEC_RECOVER_MODE=liquidate`,
+for an unpriced balance (reported, not silently dropped) and for the entry block a
+priced leftover raises, plus the per-symbol `/market/detail/merged` quote parser.
+The exit path is also covered for the venue-minimum
 error that drops an unsellable residual instead of retrying. Entry routing is pinned
 too: breakout entries cross the spread, pullback entries rest one step above the bid
 without ever crossing, and a resting entry is cancelled once the market runs more than

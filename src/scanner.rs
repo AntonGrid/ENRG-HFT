@@ -20,6 +20,8 @@ use serde_json::Value;
 const DEFAULT_REST_URL: &str = "https://api.htx.com";
 const TICKERS_PATH: &str = "/market/tickers";
 const SYMBOLS_PATH: &str = "/v1/common/symbols";
+/// Per-symbol merged depth: the fallback for a market the bulk board omits.
+const MERGED_PATH: &str = "/market/detail/merged";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DEFAULT_INTERVAL_SECS: u64 = 90;
@@ -245,6 +247,22 @@ impl Scanner {
             .collect())
     }
 
+    /// Prices one market, even when the bulk ticker board does not carry it.
+    ///
+    /// Recovery must be able to value *any* balance the account holds, so a
+    /// symbol missing from `/market/tickers` (a fresh listing, a renamed market)
+    /// is requested directly instead of being written off as unsellable.
+    pub async fn quote_for(&self, symbol: &str) -> Result<Option<SpotQuote>, ScannerError> {
+        if let Some(quote) = self.quotes().await?.get(symbol).cloned() {
+            return Ok(Some(quote));
+        }
+        let value = self
+            .fetch(&format!("{MERGED_PATH}?symbol={symbol}"))
+            .await?;
+        let metas = self.symbol_meta().await;
+        Ok(parse_merged_quote(&value, symbol, &metas, &self.config))
+    }
+
     async fn symbol_meta(&self) -> HashMap<String, SymbolMeta> {
         match self.fetch(SYMBOLS_PATH).await {
             Ok(value) => parse_symbol_meta(&value),
@@ -347,6 +365,44 @@ fn spot_quote(
         last: ticker.close,
         best_bid: ticker.bid,
         best_ask: ticker.ask,
+        base_step,
+        price_step,
+    })
+}
+
+/// Parses `/market/detail/merged` into a [`SpotQuote`].
+///
+/// The response nests everything under `tick`, with `bid`/`ask` as
+/// `[price, size]` arrays. Pure, so the wire format is covered without the
+/// network; a market that is closed or has no price yields `None`.
+fn parse_merged_quote(
+    value: &Value,
+    symbol: &str,
+    metas: &HashMap<String, SymbolMeta>,
+    config: &ScannerConfig,
+) -> Option<SpotQuote> {
+    let tick = value.get("tick")?;
+    let last = tick
+        .get("close")
+        .and_then(decimal_from_value)
+        .filter(|last| *last > Decimal::ZERO)?;
+    let side = |name: &str| {
+        tick.get(name)
+            .and_then(Value::as_array)
+            .and_then(|levels| levels.first())
+            .and_then(decimal_from_value)
+            .filter(|price| *price > Decimal::ZERO)
+    };
+    let (base_step, price_step) = metas
+        .get(symbol)
+        .map(|meta| (meta.base_step, meta.price_step))
+        .unwrap_or((config.fallback_base_step, config.fallback_price_step));
+
+    Some(SpotQuote {
+        symbol: symbol.to_string(),
+        last,
+        best_bid: side("bid"),
+        best_ask: side("ask"),
         base_step,
         price_step,
     })
@@ -752,6 +808,45 @@ mod tests {
         assert_eq!(metas["listausdt"].base_step, dec("1"));
         assert_eq!(metas["listausdt"].price_step, dec("0.000001"));
         assert!(!metas.contains_key("badsymbol"));
+    }
+
+    #[test]
+    fn parses_a_per_symbol_merged_quote() {
+        // The shape `/market/detail/merged?symbol=…` returns; recovery uses it
+        // for a market the bulk ticker board did not carry.
+        let value = json!({
+            "status": "ok",
+            "ch": "market.trumpusdt.detail.merged",
+            "tick": { "close": 3.4, "bid": [3.39, 120.5], "ask": [3.41, 80.0] }
+        });
+        let quote = parse_merged_quote(&value, "trumpusdt", &metas(), &config())
+            .expect("a live market must be priceable");
+        assert_eq!(quote.symbol, "trumpusdt");
+        assert_eq!(quote.last, dec("3.4"));
+        assert_eq!(quote.best_bid, Some(dec("3.39")));
+        assert_eq!(quote.best_ask, Some(dec("3.41")));
+        assert_eq!(quote.mark(), Some(dec("3.4")));
+        assert_eq!(
+            quote.base_step,
+            dec("0.000001"),
+            "an unknown market uses the fallback step"
+        );
+
+        // A closed or empty market has nothing to price and must say so.
+        assert!(parse_merged_quote(
+            &json!({ "tick": { "close": 0.0 } }),
+            "trumpusdt",
+            &metas(),
+            &config()
+        )
+        .is_none());
+        assert!(parse_merged_quote(
+            &json!({ "status": "error" }),
+            "trumpusdt",
+            &metas(),
+            &config()
+        )
+        .is_none());
     }
 
     #[test]
