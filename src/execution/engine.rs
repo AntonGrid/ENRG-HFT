@@ -372,6 +372,55 @@ fn is_order_value_min_error(error: &ExecutionError) -> bool {
     }
 }
 
+/// `true` when the venue refused an order because the account does not hold
+/// enough of the asset being sold.
+///
+/// HTX answers a sell of a balance it does not have with
+/// `account-frozen-balance-insufficient-error` (`left: 0`), the other venues
+/// phrase the same refusal as `insufficient-balance` or "balance is not
+/// enough". For the executor this is not a failed order but a stale book: the
+/// position was closed by hand, by an external script, or by a fill this
+/// process never saw.
+///
+/// The refusal must name a balance. "Insufficient" on its own is not enough —
+/// `insufficient-liquidity` is a reason to wait, and `order-value-min-error`
+/// (a dust position below the venue minimum) has its own terminal path.
+fn is_insufficient_balance_error(error: &ExecutionError) -> bool {
+    let ExecutionError::Api { code, message } = error else {
+        return false;
+    };
+    let text = format!("{code} {message}").to_ascii_lowercase();
+    let names_balance = text.contains("balance") || text.contains("funds");
+    names_balance
+        && (text.contains("insufficient")
+            || text.contains("not enough")
+            || text.contains("no enough"))
+}
+
+/// What a refused exit order means for the local book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitRejection {
+    /// The venue holds less than the book thinks: the book is stale.
+    Desync,
+    /// The whole position is below the venue minimum and can never be sold.
+    Dust,
+    /// A transport blip, a rate limit or a venue-side rejection: worth another
+    /// attempt after a pause.
+    Retry,
+}
+
+/// Classifies a refused exit before anything is retried. Pure, so the decision
+/// is testable without a venue.
+fn classify_exit_rejection(error: &ExecutionError) -> ExitRejection {
+    if is_insufficient_balance_error(error) {
+        ExitRejection::Desync
+    } else if is_order_value_min_error(error) {
+        ExitRejection::Dust
+    } else {
+        ExitRejection::Retry
+    }
+}
+
 /// `true` when HTX says the order does not exist. Such an order cannot be
 /// cancelled and cannot fill any more, so a cancel loop must end instead of
 /// retrying it forever.
@@ -1691,6 +1740,69 @@ impl Executor {
         self.publish_account();
     }
 
+    /// Resets the local book after the venue refused a sell for insufficient
+    /// balance.
+    ///
+    /// This is a desync, not a failed order: the asset was closed by hand, by an
+    /// external script, or by a fill this process never saw. No fill happened,
+    /// so cash, fees and trade counters keep their values; only the phantom
+    /// position, its peak, its retry timer and the pair pin are dropped. The
+    /// venue balance is then re-read (live only) so the AI context shows the
+    /// account that actually exists instead of the book that was just corrected.
+    async fn reset_desynced_position(
+        &mut self,
+        symbol: &str,
+        amount: Decimal,
+        error: &ExecutionError,
+    ) {
+        eprintln!("[EXEC] WARNING: position desync detected, resetting to flat");
+        eprintln!(
+            "[EXEC] the venue refused the exit of {} {} ({error}); it holds no such balance, so the position is forgotten instead of retried",
+            amount,
+            symbol.to_uppercase()
+        );
+        self.drop_tracked_position();
+        if self.broker.is_paper() {
+            return;
+        }
+        let previous = self.live_balance;
+        match self.sync_live_balance().await {
+            Ok(balance) => log_live_balance(previous, balance),
+            Err(error) => eprintln!("[EXEC] balance refresh after desync failed: {error}"),
+        }
+    }
+
+    /// Handles a refused exit order. Returns `true` when the position itself is
+    /// gone, so the caller must not retry the order.
+    ///
+    /// Two refusals are terminal for the position rather than for the attempt:
+    /// an insufficient balance (the venue does not hold what the book thinks,
+    /// and retrying would sell nothing forever while the stale position keeps
+    /// blocking every new entry) and a position below the venue minimum (dust
+    /// that can never be sold). Everything else — a timeout, a 5xx, a rate
+    /// limit — stays a retry after [`EXIT_RETRY_DELAY`].
+    async fn handle_exit_error(
+        &mut self,
+        symbol: &str,
+        amount: Decimal,
+        error: &ExecutionError,
+    ) -> bool {
+        match classify_exit_rejection(error) {
+            ExitRejection::Desync => {
+                self.reset_desynced_position(symbol, amount, error).await;
+                true
+            }
+            ExitRejection::Dust => {
+                eprintln!(
+                    "[EXEC] exit rejected as below the venue minimum: {error}; dropping the position so it is not retried"
+                );
+                self.drop_tracked_position();
+                true
+            }
+            ExitRejection::Retry => false,
+        }
+    }
+
     /// Closes the position on the trailing stop or the hard stop-loss, using the
     /// book of the symbol that is actually held.
     async fn maybe_exit(&mut self) {
@@ -1826,11 +1938,10 @@ impl Executor {
                 self.absorb_working().await;
             }
             Err(error) => {
-                if is_order_value_min_error(&error) {
-                    eprintln!(
-                        "[EXEC] exit rejected as below the venue minimum: {error}; dropping the position so it is not retried"
-                    );
-                    self.drop_tracked_position();
+                // A refused exit is not always a failed order: an insufficient
+                // balance means the venue no longer holds the position, and
+                // retrying it would block every entry until a restart.
+                if self.handle_exit_error(&symbol, amount, &error).await {
                     return;
                 }
                 self.exit_retry_after = Some(now + EXIT_RETRY_DELAY);
@@ -1905,9 +2016,13 @@ impl Executor {
                         });
                         self.absorb_working().await;
                     }
-                    Err(error) => eprintln!(
-                        "[EXEC] kill-switch order failed: {error}; the position is still open"
-                    ),
+                    Err(error) => {
+                        if !self.handle_exit_error(&symbol, qty.abs(), &error).await {
+                            eprintln!(
+                                "[EXEC] kill-switch order failed: {error}; the position is still open"
+                            );
+                        }
+                    }
                 }
             } else {
                 eprintln!("[EXEC] kill switch: no price available to flatten the position");
@@ -3049,6 +3164,82 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn insufficient_balance_error_is_recognized() {
+        let api = |code: &str, message: &str| ExecutionError::Api {
+            code: code.into(),
+            message: message.into(),
+        };
+
+        // The exact refusal from the bug report: a sell of a position the venue
+        // does not hold any more.
+        assert!(is_insufficient_balance_error(&api(
+            "account-frozen-balance-insufficient-error",
+            "left: 0"
+        )));
+        assert!(is_insufficient_balance_error(&api(
+            "insufficient-balance",
+            ""
+        )));
+        assert!(is_insufficient_balance_error(&api(
+            "invalid-argument",
+            "balance is not enough"
+        )));
+        assert!(is_insufficient_balance_error(&api(
+            "invalid-argument",
+            "insufficient funds for the order"
+        )));
+
+        // A dust position below the venue minimum is a different terminal
+        // refusal and must keep its own path.
+        assert!(!is_insufficient_balance_error(&api(
+            "order-value-min-error",
+            "order value cannot be less than 1 USDT"
+        )));
+        // A thin book is a reason to wait, not to forget a position.
+        assert!(!is_insufficient_balance_error(&api(
+            "insufficient-liquidity",
+            "not enough liquidity at the touch"
+        )));
+        assert!(!is_insufficient_balance_error(&api(
+            "invalid-argument",
+            "invalid symbol"
+        )));
+        assert!(!is_insufficient_balance_error(&ExecutionError::Http(
+            "timeout".into()
+        )));
+    }
+
+    #[test]
+    fn a_refused_exit_is_classified_before_it_is_retried() {
+        let api = |code: &str, message: &str| ExecutionError::Api {
+            code: code.into(),
+            message: message.into(),
+        };
+
+        assert_eq!(
+            classify_exit_rejection(&api("account-frozen-balance-insufficient-error", "left: 0")),
+            ExitRejection::Desync,
+            "the venue holds none of the position: the book is stale"
+        );
+        assert_eq!(
+            classify_exit_rejection(&api(
+                "order-value-min-error",
+                "order value cannot be less than 1 USDT"
+            )),
+            ExitRejection::Dust
+        );
+        assert_eq!(
+            classify_exit_rejection(&api("rate-limit", "too many requests")),
+            ExitRejection::Retry
+        );
+        assert_eq!(
+            classify_exit_rejection(&ExecutionError::Http("timeout".into())),
+            ExitRejection::Retry,
+            "a transport failure says nothing about the position"
+        );
+    }
+
     fn spot_quote(
         symbol: &str,
         last: &str,
@@ -3384,6 +3575,99 @@ mod tests {
             subscriptions_rx.borrow().is_empty(),
             "a dropped position must leave the websocket watchlist"
         );
+    }
+
+    #[tokio::test]
+    async fn an_insufficient_balance_exit_resets_the_book_to_flat() {
+        // The bug report: 0.110 SOLUSDT tracked locally, the venue holds none.
+        let board = board_with(&[]);
+        let mut executor = executor(config(), board.clone());
+        let (subscriptions_tx, subscriptions_rx) = watch::channel(Vec::new());
+        executor.subscriptions_tx = Some(subscriptions_tx);
+        let holding = recovered_holding("SOL", "0.11", "0.11", "200", "0.001", "0.01");
+        assert!(executor.adopt_recovered_position(&holding));
+        executor.open_fees = dec("0.01");
+        let cash = executor.portfolio.cash;
+        let error = ExecutionError::Api {
+            code: "account-frozen-balance-insufficient-error".into(),
+            message: "left: 0".into(),
+        };
+
+        let handled = executor
+            .handle_exit_error("solusdt", dec("0.11"), &error)
+            .await;
+
+        assert!(handled, "a desync must stop the exit retry loop");
+        assert!(
+            executor.portfolio.position.is_flat(),
+            "the phantom position is forgotten, not sold again"
+        );
+        assert_eq!(executor.portfolio.cash, cash, "no fill means no cash move");
+        assert_eq!(executor.open_symbol, None);
+        assert_eq!(executor.opened_at, None);
+        assert_eq!(executor.peak_mark, None);
+        assert_eq!(executor.open_fees, Decimal::ZERO);
+        assert_eq!(
+            executor.exit_retry_after, None,
+            "nothing may be scheduled to retry"
+        );
+        assert!(executor.working.is_none());
+        assert!(
+            subscriptions_rx.borrow().is_empty(),
+            "the pair leaves the websocket watchlist"
+        );
+
+        // The next tick must not resurrect the exit: the book is flat and there
+        // is no order to place.
+        executor.on_tick().await;
+        assert!(executor.working.is_none());
+        assert!(executor.portfolio.position.is_flat());
+    }
+
+    #[tokio::test]
+    async fn a_transient_exit_failure_keeps_the_position() {
+        // A timeout says nothing about what the venue holds: forgetting a real
+        // position would be far worse than one more attempt.
+        let board = board_with(&[]);
+        let mut executor = executor(config(), board.clone());
+        let holding = recovered_holding("SOL", "0.11", "0.11", "200", "0.001", "0.01");
+        assert!(executor.adopt_recovered_position(&holding));
+
+        let handled = executor
+            .handle_exit_error(
+                "solusdt",
+                dec("0.11"),
+                &ExecutionError::Http("timeout".into()),
+            )
+            .await;
+
+        assert!(!handled, "a transport failure must stay retryable");
+        assert_eq!(executor.portfolio.position.qty(), dec("0.11"));
+        assert_eq!(executor.open_symbol.as_deref(), Some("solusdt"));
+    }
+
+    #[tokio::test]
+    async fn a_below_minimum_exit_still_drops_the_residual() {
+        // The unified handler must keep the older dust behaviour: a position
+        // below the venue minimum can never be sold and must not be retried.
+        let board = board_with(&[]);
+        let mut executor = executor(config(), board.clone());
+        let holding = recovered_holding("DNA", "0.0000976", "0.0000976", "0.04", "1", "0.0001");
+        assert!(executor.adopt_recovered_position(&holding));
+
+        let handled = executor
+            .handle_exit_error(
+                "dnausdt",
+                dec("0.0000976"),
+                &ExecutionError::Api {
+                    code: "order-value-min-error".into(),
+                    message: "order value cannot be less than 1 USDT".into(),
+                },
+            )
+            .await;
+
+        assert!(handled);
+        assert!(executor.portfolio.position.is_flat());
     }
 
     #[test]

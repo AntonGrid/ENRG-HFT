@@ -284,6 +284,16 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 - An exit rejected with HTX `order-value-min-error` is logged once and the
   residual is dropped from local state, so the bot never spams the venue with an
   order that can never be filled.
+- An exit refused because the account holds no such balance
+  (`account-frozen-balance-insufficient-error`, `left: 0`) is treated as a
+  **desync**, not as a failed order: the bot logs
+  `[EXEC] WARNING: position desync detected, resetting to flat`, forgets the
+  phantom position — cash, fees and trade counters are untouched because no
+  fill happened — drops the pair pin and never retries the sell. This is how a
+  position closed by hand or by an external script stops blocking every new
+  entry, and it applies to the kill switch as well as to the trailing stop. A
+  transient failure (timeout, 5xx, rate limit) still retries after 2 s: only a
+  refusal that names the balance may reset the book.
 - Cancels use the v1 `submitcancel` endpoint (a `/cancel` path answers 404 with
   an empty body, which no retry loop can distinguish from a network blip), are
   retried with a capped backoff and halt entries after 10 failures. An order the
@@ -300,7 +310,7 @@ account: equity=1000 cash=1000 position_symbol=- position_qty=0 ...
 cargo test
 ```
 
-148 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
+153 unit tests, no network required: Decimal EMA / Wilder / ATR / ADX / VWAP math,
 volume-spike detection, scanner filtering and ranking, per-symbol bar aggregation,
 the trend filter (breakout, pullback, chop, downtrend, warm-up, cooldown), watchlist
 pinning, the exit policy (hard stop, ATR trail, trend flip, unwarmed fallback),
@@ -314,7 +324,10 @@ dropped out of the watchlist (it is still managed), for `EXEC_RECOVER_MODE=liqui
 for an unpriced balance (reported, not silently dropped) and for the entry block a
 priced leftover raises, plus the per-symbol `/market/detail/merged` quote parser.
 The exit path is also covered for the venue-minimum
-error that drops an unsellable residual instead of retrying. Entry routing is pinned
+error that drops an unsellable residual instead of retrying, for the
+insufficient-balance refusal that resets a phantom position to flat without
+touching cash, and for the transport failure that must keep a real position
+retryable. Entry routing is pinned
 too: breakout entries cross the spread, pullback entries rest one step above the bid
 without ever crossing, and a resting entry is cancelled once the market runs more than
 `EXEC_ENTRY_MAX_CHASE_BPS` above it. The cancel path itself is a golden-string test
